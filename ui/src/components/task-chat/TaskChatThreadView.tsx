@@ -24,6 +24,7 @@ import { TaskMessageScroller } from "./TaskMessageScroller";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
+import { TaskChatTranscriptSlot } from "./TaskChatTranscriptSlot";
 
 const EMPTY_ATTACHMENTS: IssueAttachment[] = [];
 
@@ -74,6 +75,12 @@ interface TaskChatThreadViewProps {
   scroll?: boolean;
   attachments?: IssueAttachment[];
   onOpenSkill?: (skillId: string, name: string) => void;
+  /**
+   * Re-reads ONE run's transcript (REK-311). Scoped on purpose: the old
+   * thread-level Retry refetched every run's log, which on a long issue meant
+   * hundreds of requests for one broken run.
+   */
+  onRetryTranscript?: (runId: string) => void;
 }
 
 function renderItem(
@@ -95,6 +102,7 @@ function renderItem(
   retryFailedRunId?: string | null,
   attachments: IssueAttachment[] = [],
   onOpenSkill?: (skillId: string, name: string) => void,
+  onRetryTranscript?: (runId: string) => void,
 ) {
   switch (item.kind) {
     case "project_created": return <TaskChatProjectCreatedCard item={item} />;
@@ -221,6 +229,8 @@ function renderItem(
       );
     case "brief":
       return renderBrief ? renderBrief() : null;
+    case "transcript_placeholder":
+      return <TaskChatTranscriptSlot item={item} onRetry={onRetryTranscript} />;
     case "turn":
       return (
         <TaskChatTurn
@@ -264,6 +274,7 @@ function renderItem(
 function isSystemLikeItem(item: TaskChatItem): boolean {
   return (
     item.kind === "marker" ||
+    item.kind === "transcript_placeholder" ||
     (item.kind === "message" && item.author === "system")
   );
 }
@@ -302,6 +313,7 @@ export function TaskChatThreadView({
   tryAgainNoLiveExecutionPathPending = false,
   onRetryFailedRun,
   retryFailedRunId = null,
+  onRetryTranscript,
   tail,
   contentKey,
   className,
@@ -344,6 +356,7 @@ export function TaskChatThreadView({
               retryFailedRunId,
               attachments,
               onOpenSkill,
+              onRetryTranscript,
             ),
           }))
           .filter((entry) => entry.content !== null)
@@ -402,6 +415,8 @@ export function TaskChatThreadView({
                   onRetryFailedRun,
                   retryFailedRunId,
                   attachments,
+                  undefined,
+                  onRetryTranscript,
                 )}
               </div>
             ))}
@@ -412,6 +427,7 @@ export function TaskChatThreadView({
     renderInteraction, renderBrief, renderMessageActions, renderQueuedAction,
     onTryAgainNoLiveExecutionPath, tryAgainNoLiveExecutionPathPending,
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill,
+    onRetryTranscript,
   ]);
   const body = (
     <div
@@ -468,6 +484,12 @@ function signatureOf(it: TaskChatItem): number {
       (n, child) => n + signatureOf(child),
       it.items.length + headerSig + (it.finalResponse?.text.length ?? 0),
     );
+  }
+  if (it.kind === "transcript_placeholder") {
+    // Must not collide with a resolved settled turn (which signs as 1): the
+    // scroller reconciles — and holds the reading position — on this key, so
+    // "placeholder" and "transcript" have to be different keys.
+    return it.state === "error" ? 3 : 2;
   }
   if (it.kind === "activity_phase") {
     return it.items.reduce(

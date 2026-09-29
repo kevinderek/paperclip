@@ -2326,7 +2326,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               initialHistoryPending ||
               commentsInitialLoading ||
               activityPending ||
-              linkedRunsPending ||
+              // REK-311: the runs list is no longer part of the reveal gate.
+              // It used to make the whole conversation wait for the list route
+              // (4,9 s on REK-234, 29-09 11:3xZ) before a single message could
+              // render. Runs still gate their own transcript placeholders, and
+              // `linkedRunsError` stays in the message error bar below.
               !runtimeSelectionKnown)
             }
             initialHistoryError={

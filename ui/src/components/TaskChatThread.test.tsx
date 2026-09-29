@@ -19,13 +19,17 @@ import type { HeartbeatRunEvent } from "@paperclipai/shared";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
+  errorsByRun: new Map(),
   isInitialHydrating: false,
   hydratedRunIds: undefined as Set<string> | undefined,
+  /** Run ids passed to the per-run retry, in call order (REK-311). */
+  retriedRunIds: [] as (string | undefined)[],
 }));
 const nativeTranscriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
   errorsByRun: new Map(),
   hydratedRunIds: undefined as Set<string> | undefined,
+  retriedRunIds: [] as (string | undefined)[],
 }));
 const transcriptHookRuns = vi.hoisted(() => ({
   legacy: [] as unknown[][],
@@ -48,8 +52,10 @@ vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
     transcriptHookRuns.legacy.push(runs);
     return {
       transcriptByRun: new Map(transcriptState.transcriptByRun),
+      errorsByRun: new Map(transcriptState.errorsByRun),
       isInitialHydrating: transcriptState.isInitialHydrating,
       hydratedRunIds: transcriptState.hydratedRunIds,
+      retry: (runId?: string) => transcriptState.retriedRunIds.push(runId),
     };
   },
 }));
@@ -60,6 +66,7 @@ vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
       transcriptByRun: new Map(nativeTranscriptState.transcriptByRun),
       errorsByRun: new Map(nativeTranscriptState.errorsByRun),
       hydratedRunIds: nativeTranscriptState.hydratedRunIds,
+      retry: (runId?: string) => nativeTranscriptState.retriedRunIds.push(runId),
     };
   },
 }));
@@ -109,11 +116,14 @@ let queryClient: QueryClient;
 beforeEach(() => {
   localStorage.clear();
   transcriptState.transcriptByRun.clear();
+  transcriptState.errorsByRun.clear();
   transcriptState.isInitialHydrating = false;
   transcriptState.hydratedRunIds = undefined;
+  transcriptState.retriedRunIds.length = 0;
   nativeTranscriptState.transcriptByRun.clear();
   nativeTranscriptState.errorsByRun.clear();
   nativeTranscriptState.hydratedRunIds = undefined;
+  nativeTranscriptState.retriedRunIds.length = 0;
   transcriptHookRuns.legacy.length = 0;
   transcriptHookRuns.native.length = 0;
   sidebarState.isMobile = false;
@@ -149,7 +159,21 @@ function render(ui: ReactElement) {
   );
 }
 
-it("coordinates first reveal while keeping the composer and visible history mounted through refresh", async () => {
+/**
+ * The reveal latch still tracks the MESSAGE layer only. `act` is not used here
+ * on purpose: in this container `act` is exported as `undefined` by the
+ * installed React (measured, and identical on an untouched checkout), so a test
+ * that awaits it fails for a reason that has nothing to do with the thread.
+ */
+async function settleReveal() {
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  // The reveal state lands in a rAF outside flushSync, so give React a
+  // macrotask to commit it and then drain anything left.
+  await new Promise((resolve) => setTimeout(resolve));
+  flushSync(() => {});
+}
+
+it("coordinates first reveal on the message layer and never conceals the thread", async () => {
   const props = {
     issueId: "coordinated-issue",
     comments: [],
@@ -159,16 +183,22 @@ it("coordinates first reveal while keeping the composer and visible history moun
   const composer = container.querySelector('[data-testid="mock-editor"]');
   expect(composer).not.toBeNull();
   expect(container.querySelector('[aria-busy="true"]')).not.toBeNull();
+  // REK-311: no thread-level loading overlay exists any more, and the real
+  // thread is never hidden or made inert while messages are in flight.
+  expect(
+    container.querySelector('[data-testid="task-chat-history-loading"]'),
+  ).toBeNull();
+  expect(container.querySelector("[inert]")).toBeNull();
   render(<TaskChatThread {...props} initialHistoryPending={false} />);
-  await act(async () => {
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-  });
+  await settleReveal();
   expect(container.querySelector('[aria-busy="false"]')).not.toBeNull();
   expect(container.querySelector('[data-testid="mock-editor"]')).toBe(composer);
+  // A refetch must not re-hide an already revealed conversation (the latch).
   render(<TaskChatThread {...props} initialHistoryPending />);
   expect(
     container.querySelector('[data-testid="task-chat-history-loading"]'),
   ).toBeNull();
+  expect(container.querySelector("[inert]")).toBeNull();
   expect(container.querySelector('[data-testid="mock-editor"]')).toBe(composer);
 });
 
@@ -187,6 +217,21 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     transcriptState.hydratedRunIds = new Set();
     nativeTranscriptState.hydratedRunIds = new Set();
   });
+
+  const errorsFor = (runId: string) => {
+    if (runtimeMode === "native") {
+      nativeTranscriptState.errorsByRun.set(runId, {
+        message: "boom",
+        failedAt: "2026-08-25T18:05:00.000Z",
+      });
+    } else {
+      transcriptState.errorsByRun.set(runId, new Error("boom"));
+    }
+  };
+  const hydrate = (runId: string) => {
+    transcriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+  };
 
   it("reveals comments while a scheduled retry has no transcript to hydrate", () => {
     render(
@@ -209,8 +254,8 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
   });
 
   it.each(["running", "succeeded"])(
-    "waits for a %s run to hydrate even when a scheduled retry is present",
-    async (status) => {
+    "reveals a %s run's conversation before its transcript arrives, and holds the run's own row open",
+    (status) => {
       const props = {
         issueId: "issue-1",
         comments: createLongThreadComments(),
@@ -226,24 +271,66 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
         ],
       };
       render(<TaskChatThread {...props} />);
-      expect(container.querySelector('[aria-busy="true"]')).not.toBeNull();
+
+      // The whole point of the split: the messages are readable immediately.
+      expect(container.querySelector('[aria-busy="false"]')).not.toBeNull();
+      expect(container.querySelector("[inert]")).toBeNull();
+      expect(container.textContent).toContain("Thread message 1");
+      // And the un-hydrated run keeps a row of its own rather than vanishing.
       expect(
-        container.querySelector('[data-testid="task-chat-history-loading"]'),
+        container.querySelector('[data-testid="transcript-slot-started-run"]'),
       ).not.toBeNull();
 
-      transcriptState.hydratedRunIds = new Set(["started-run"]);
-      nativeTranscriptState.hydratedRunIds = new Set(["started-run"]);
+      hydrate("started-run");
       render(<TaskChatThread {...props} />);
-      await act(async () => {
-        await new Promise((resolve) => requestAnimationFrame(resolve));
-      });
-
-      expect(container.querySelector('[aria-busy="false"]')).not.toBeNull();
+      // Once hydrated the placeholder is gone: resolved, not duplicated.
       expect(
-        container.querySelector('[data-testid="task-chat-history-loading"]'),
+        container.querySelector('[data-testid="transcript-slot-started-run"]'),
       ).toBeNull();
     },
   );
+
+  it("keeps a failed run's own row and retries that run alone", () => {
+    const props = {
+      issueId: "issue-1",
+      comments: createLongThreadComments(),
+      onAdd: async () => {},
+      linkedRuns: [
+        retryRun,
+        {
+          ...retryRun,
+          runId: "started-run",
+          status: "succeeded" as const,
+          startedAt: "2026-08-25T18:00:00.000Z",
+        },
+      ],
+    };
+    hydrate("started-run");
+    errorsFor("started-run");
+    render(<TaskChatThread {...props} />);
+
+    // The failure is per run now, so it is not folded into the thread-level bar.
+    expect(container.textContent).not.toContain(
+      "Some task history could not be loaded.",
+    );
+    const row = container.querySelector(
+      '[data-testid="transcript-slot-error-started-run"]',
+    );
+    expect(row).not.toBeNull();
+
+    const retry = Array.from(row!.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Retry",
+    );
+    expect(retry).toBeDefined();
+    flushSync(() => retry!.click());
+
+    // Scoped to the one run — not a refetch of every log on the issue.
+    expect(
+      runtimeMode === "native"
+        ? nativeTranscriptState.retriedRunIds
+        : transcriptState.retriedRunIds,
+    ).toEqual(["started-run"]);
+  });
 });
 
 it("preserves the typed disposition notice through the task-chat adapter", () => {

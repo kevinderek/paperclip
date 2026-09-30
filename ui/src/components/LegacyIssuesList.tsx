@@ -3,6 +3,7 @@ import { startTransition, useDeferredValue, useEffect, useMemo, useState, useCal
 import type { ReactNode } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVisibilityRefetchInterval } from "@/lib/polling";
+import { BLOCKED_STATUS_LABEL, issueStatusLabelOverride } from "../lib/issue-status-labels";
 import { accessApi } from "../api/access";
 import { useDialogActions } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
@@ -128,7 +129,7 @@ const issueStatusLabels: Record<IssueStatus, string> = {
   in_progress: "In progress",
   in_review: "In review",
   done: "Done",
-  blocked: "Blocked",
+  blocked: BLOCKED_STATUS_LABEL,
   cancelled: "Cancelled",
 };
 const progressSegmentClasses: Record<IssueStatus, string> = {
@@ -1220,7 +1221,7 @@ export function IssuesList({
       const groups = groupBy(filtered, (i) => i.status);
       return issueStatusOrder
         .filter((s) => groups[s]?.length)
-        .map((s) => ({ key: s, label: issueFilterLabel(s), items: groups[s]! }));
+        .map((s) => ({ key: s, label: issueStatusLabelOverride(s) ?? issueFilterLabel(s), items: groups[s]! }));
     }
     if (viewState.groupBy === "priority") {
       const groups = groupBy(filtered, (i) => i.priority);

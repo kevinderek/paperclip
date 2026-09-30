@@ -5,6 +5,7 @@ import type { Issue } from "@paperclipai/shared";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { timeAgo } from "@/lib/timeAgo";
 import { createIssueDetailPath, withIssueDetailHeaderSeed } from "@/lib/issueDetailBreadcrumb";
+import { issueStatusLabelOverride } from "../lib/issue-status-labels";
 import {
   getIssueDetailQueryOptions,
   ISSUE_DETAIL_STALE_TIME_MS,
@@ -129,6 +130,8 @@ function QuicklookSeparator({ className }: { className?: string }) {
 
 /** "in_review" -> "In review". The card states the status as a word, not a chip. */
 function statusLabel(status: string): string {
+  const renamed = issueStatusLabelOverride(status);
+  if (renamed) return renamed;
   const words = status.replace(/_/g, " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
 }

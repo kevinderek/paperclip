@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../../api/client";
@@ -307,17 +306,18 @@ describe("useLiveRunTranscripts", () => {
       latest = useLiveRunTranscripts({ companyId: "company-1", runs, enableRealtimeUpdates: false });
       return null;
     }
-    // `act`-free on purpose: the installed react build exports it as undefined
-    // under the react-server condition vitest 4 applies, which is why every
-    // other test in this file fails in that container. A macrotask is the
-    // smallest wait that lets the read promise resolve AND React commit the
-    // state update; microtask ticks alone are not enough.
-    const settle = async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    // A macrotask is the smallest wait that lets the read promise resolve, and
+    // `act` flushes the state update that follows. The macrotask alone is not
+    // enough in an environment where `act` exists: React then warns that an
+    // update was never wrapped, and the hook's state is not committed.
+    const settle = async (fn: () => void = () => {}) => {
+      await act(async () => {
+        fn();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
     };
     try {
-      flushSync(() => root.render(<Harness />));
-      await settle();
+      await settle(() => root.render(<Harness />));
       expect(latest.hydratedRunIds?.has("run-settled")).toBe(true);
       expect(latest.hydratedRunIds?.has("run-stalled")).toBe(false);
       const before = logMock.mock.calls.length;
@@ -325,8 +325,7 @@ describe("useLiveRunTranscripts", () => {
       logMock.mockImplementation(async (...args: unknown[]) =>
         logResult(args[0] as string),
       );
-      flushSync(() => latest.retry("run-broken"));
-      await settle();
+      await settle(() => latest.retry("run-broken"));
 
       // The interrupted read is retried, so its row cannot stay "Loading".
       expect(latest.hydratedRunIds?.has("run-stalled")).toBe(true);
@@ -341,8 +340,7 @@ describe("useLiveRunTranscripts", () => {
       resolveStalled(stalled);
       await settle();
     } finally {
-      // No `act` in the teardown, for the same reason as above.
-      root.unmount();
+      act(() => root.unmount());
     }
   });
 

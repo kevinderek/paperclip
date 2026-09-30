@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
+import { legacyDispositionEpisode } from "../services/recovery/legacy-continuation.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -174,6 +175,93 @@ describe("legacy continuation persisted authority", () => {
     const f = await fixture({}, 2);
     expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("escalated");
     expect(await f.runs()).toHaveLength(1);
+  });
+
+  // A comment that reopens a stranded issue mints a fresh legacy episode, so an
+  // episode-anchored budget can never run out. These three tests pin the durable
+  // source state as the anchor instead: a reopen that changes nothing is refused
+  // a fresh budget, a durable change still earns one, and an explicit board
+  // settle still opens the handle.
+  async function exhaustedAfterReopen() {
+    const f = await fixture();
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    const first = (await f.runs()).find(r => r.id !== f.runId)!;
+    await f.finish(first);
+    await f.createRecovery().reconcileLegacyContinuation(first.id);
+    const second = (await f.runs()).find(r => r.status === "scheduled_retry")!;
+    await f.finish(second);
+    expect(await f.createRecovery().reconcileLegacyContinuation(second.id)).toBe("escalated");
+    const escalated = (await f.actions()).find(a => a.status === "active")!;
+    const sourceStateFingerprint = escalated.evidence.sourceStateFingerprint as string;
+    expect(sourceStateFingerprint).toMatch(/^disposition_repair:v1:/);
+    // Reproduce the reopen exactly as the comment route leaves it: the issue
+    // returns to todo, the standing escalation is cancelled as stale
+    // (source_revalidation), and the wake runs as a brand new episode.
+    await db.update(issueRecoveryActions)
+      .set({ status: "cancelled", outcome: "cancelled", resolutionNote: "source_revalidation", resolvedAt: new Date(), updatedAt: new Date() })
+      .where(eq(issueRecoveryActions.id, escalated.id));
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    await db.insert(issueComments).values({
+      companyId: f.companyId,
+      issueId: f.issueId,
+      authorType: "user",
+      authorUserId: "fixture-owner",
+      body: "Board handed this back, please try again.",
+    });
+    const [reopened] = await db.insert(heartbeatRuns).values({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      invocationSource: "automation",
+      status: "succeeded",
+      runtimeMode: "legacy",
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_reopened_via_comment" },
+      livenessState: "blocked",
+      resultJson: { summary: "Taking another look at this." },
+    }).returning();
+    // The reopened wake puts the issue back in_progress, which is the status it
+    // also had when the exhausted escalation ran. Status is part of the digested
+    // source state, so this is what makes the digest comparable across the reopen.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+    // The loop precondition: a fresh episode id over an unchanged source state.
+    expect(legacyDispositionEpisode(second).id).not.toBe(legacyDispositionEpisode(reopened).id);
+    return { f, reopened, sourceStateFingerprint, runsBefore: (await f.runs()).length };
+  }
+
+  it("refuses a reopened issue a fresh budget while its durable source state is unchanged", async () => {
+    const { f, reopened, sourceStateFingerprint, runsBefore } = await exhaustedAfterReopen();
+    expect(await f.createRecovery().reconcileLegacyContinuation(reopened.id)).toBe("escalated");
+    // No successor agent run: the loop is closed instead of restarted.
+    expect(await f.runs()).toHaveLength(runsBefore);
+    const standing = (await f.actions()).find(a => a.status === "active")!;
+    expect(standing.evidence).toMatchObject({
+      terminalReason: "unchanged_source_state_exhausted",
+      sourceStateFingerprint,
+    });
+    expect(standing.ownerType).toBe("board");
+  });
+
+  it("grants a reopened issue a fresh budget after one durable source-state change", async () => {
+    const { f, reopened, sourceStateFingerprint } = await exhaustedAfterReopen();
+    // executionPolicy is one of the digested durable fields, so this is the
+    // positive half: the same reopen now earns a complete new budget.
+    await db.update(issues).set({ executionPolicy: { mode: "auto" } }).where(eq(issues.id, f.issueId));
+    expect(await f.createRecovery().reconcileLegacyContinuation(reopened.id)).toBe("queued");
+    const repair = (await f.runs()).find(r => (r.contextSnapshot as Record<string, any> | null)?.legacyDispositionEpisode)!;
+    expect(repair).toBeTruthy();
+    expect(repair.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: reopened.id, attempt: 1, maxAttempts: 2 } });
+    const queued = (await f.actions()).find(a => a.status === "active")!;
+    expect(queued.evidence.sourceStateFingerprint).not.toBe(sourceStateFingerprint);
+    expect(queued.attemptCount).toBe(1);
+  });
+
+  it("lets an explicit board settle clear a spent budget that a comment cannot", async () => {
+    const { f, reopened } = await exhaustedAfterReopen();
+    await db.update(issueRecoveryActions)
+      .set({ status: "resolved", outcome: "handed_back", resolutionNote: "Retrying the recorded owner.", resolvedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(issueRecoveryActions.companyId, f.companyId), eq(issueRecoveryActions.sourceIssueId, f.issueId)));
+    expect(await f.createRecovery().reconcileLegacyContinuation(reopened.id)).toBe("queued");
+    const repair = (await f.runs()).find(r => (r.contextSnapshot as Record<string, any> | null)?.legacyDispositionEpisode)!;
+    expect(repair.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: reopened.id, attempt: 1, maxAttempts: 2 } });
   });
   it.each(["done", "cancelled", "blocked", "in_review"])("honors durable %s instead of the final summary", async status => {
     const f = await fixture();

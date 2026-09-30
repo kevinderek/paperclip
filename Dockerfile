@@ -2,8 +2,24 @@
 FROM node:24-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
+# REK-394: de Playwright/Chromium-browsers zitten op een volume, maar hun
+# systeemafhankelijkheden niet. Zonder deze regel start elke headless browser
+# met "libglib-2.0.so.0: cannot open shared object file" en concludeert een agent
+# dat UI-QA onmeetbaar is -- gemeten op 2026-09-29: ldd op chrome-headless-shell
+# gaf 20 ontbrekende bibliotheken. De lijst is de directe sluiting van
+# playwright install-deps op Debian trixie, dus dezelfde die
+# `npx playwright install-deps chromium` zou zetten. fontconfig en één fonttype
+# horen erbij: zonder FONTCONFIG crasht Chromium alsnog, nu in
+# SkFontMgr_FontConfigInterface.cpp ("Not implemented").
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 tini \
+  && apt-get install -y --no-install-recommends \
+    libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatomic1 libatspi2.0-0t64 \
+    libcups2t64 libdbus-1-3 libdrm2 libexpat1 libgbm1 libglib2.0-0t64 libnspr4 \
+    libnss3 libwayland-server0 libx11-6 libx11-xcb1 libxau6 libxcb1 libxcomposite1 \
+    libxdamage1 libxdmcp6 libxext6 libxfixes3 libxi6 libxkbcommon0 libxrandr2 \
+    libxrender1 libxshmfence1 libxss1 libxtst6 \
+    fontconfig fontconfig-config fonts-dejavu-core \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 

@@ -20,6 +20,7 @@ import {
   issueComments,
   issueThreadInteractions,
   issues,
+  secretAccessEvents,
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
@@ -61,6 +62,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(issueComments);
     await db.delete(companySecretProposals);
     await db.delete(issueThreadInteractions);
+    await db.delete(secretAccessEvents);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
@@ -592,6 +594,109 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     expect(await readStoredEnvBinding(fixture.agentId, "REBIND_IDEMPOTENT")).toEqual(stored);
     expect(await db.select().from(companySecretBindings)
       .where(eq(companySecretBindings.configPath, "env.REBIND_IDEMPOTENT"))).toHaveLength(1);
+  });
+
+  it("keeps the binding ids a low-trust run holds when an identical rebinding is approved", async () => {
+    const fixture = await seedRun();
+    const boardApp = createBoardApp(fixture);
+    const secrets = secretService(db);
+    const liveSecret = await secrets.create(fixture.companyId, {
+      name: "dev/rebind/id-stable",
+      key: "REBIND_ID_STABLE",
+      provider: "local_encrypted",
+      value: "rebind-id-stable-secret",
+    });
+    const definition = await secrets.createUserSecretDefinition(fixture.companyId, {
+      key: "personal_token",
+      name: "Personal token",
+      provider: "local_encrypted",
+    });
+    await secrets.createCurrentUserSecretValue(fixture.companyId, "user-1", {
+      definitionId: definition.id,
+      value: "personal-token-secret",
+    });
+    await agentService(db).update(fixture.agentId, {
+      adapterConfig: {
+        env: { REBIND_ID_STABLE: { type: "secret_ref", secretId: liveSecret.id, version: "latest" } },
+        "access.personal_source": {
+          type: "user_secret_ref",
+          key: definition.key,
+          version: "latest",
+          required: true,
+          allowMissingOverride: false,
+        },
+        "access.personal_alias": {
+          type: "user_secret_ref",
+          key: definition.key,
+          version: "latest",
+          required: true,
+          allowMissingOverride: false,
+        },
+      },
+    });
+
+    const bindingIds = async () => (await db.select({ id: companySecretBindings.id })
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, fixture.agentId))
+      .orderBy(companySecretBindings.configPath)).map((row) => row.id);
+    const declarationIds = async () => (await db.select({ id: userSecretDeclarations.id })
+      .from(userSecretDeclarations)
+      .where(eq(userSecretDeclarations.targetId, fixture.agentId))
+      .orderBy(userSecretDeclarations.configPath)).map((row) => row.id);
+    const beforeBindingIds = await bindingIds();
+    const beforeDeclarationIds = await declarationIds();
+    expect(beforeBindingIds).toHaveLength(1);
+    expect(beforeDeclarationIds).toHaveLength(2);
+
+    // A low-trust run only receives the secret while its allowlist holds the current binding ids.
+    const agentEnv = {
+      REBIND_ID_STABLE: { type: "secret_ref" as const, secretId: liveSecret.id, version: "latest" as const },
+    };
+    const resolveAsLowTrustRun = () => secrets.resolveEnvBindings(fixture.companyId, agentEnv, {
+      consumerType: "agent",
+      consumerId: fixture.agentId,
+      actorType: "agent",
+      actorId: fixture.agentId,
+      allowedBindingIds: [...beforeBindingIds, ...beforeDeclarationIds],
+    });
+    expect((await resolveAsLowTrustRun()).env.REBIND_ID_STABLE).toBe("rebind-id-stable-secret");
+
+    // Re-approving those same bindings must write nothing: a write reaches syncAgentSecretBindings,
+    // which deletes every binding row of the target and inserts new ones with fresh primary keys,
+    // and those ids are exactly what the run above was granted.
+    const proposals = [
+      await proposeLiveSecretBinding(fixture, {
+        secretId: liveSecret.id,
+        configPath: "env.REBIND_ID_STABLE",
+      }),
+      await request(createAgentApp(fixture))
+        .post("/api/agents/me/secret-proposals")
+        .send({
+          kind: "binding",
+          sourceConfigPath: "access.personal_alias",
+          configPath: "access.personal_alias",
+          justification: "Re-bind an already bound personal credential",
+        }),
+    ];
+    expect(proposals[1].status).toBe(201);
+    for (const proposal of proposals) {
+      const approved = await request(boardApp)
+        .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposal.body.id}/approve`)
+        .send({});
+      expect(approved.status).toBe(200);
+    }
+
+    expect(await bindingIds()).toEqual(beforeBindingIds);
+    expect(await declarationIds()).toEqual(beforeDeclarationIds);
+    expect((await resolveAsLowTrustRun()).env.REBIND_ID_STABLE).toBe("rebind-id-stable-secret");
+    expect(await db.select({ action: activityLog.action }).from(activityLog).where(and(
+      eq(activityLog.entityId, fixture.agentId),
+      eq(activityLog.action, "agent.updated"),
+    ))).toEqual([]);
+    expect(await db.select({ action: activityLog.action }).from(activityLog).where(and(
+      eq(activityLog.entityId, fixture.agentId),
+      eq(activityLog.action, "agent.binding.noop"),
+    ))).toHaveLength(2);
   });
 
   it("still rejects a rebinding that points at a different secret on the same config path", async () => {

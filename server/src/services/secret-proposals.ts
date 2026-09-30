@@ -701,6 +701,7 @@ export function createSecretProposalsService(db: Db) {
           allowMissingOverride: false,
         }
       : { type: "secret_ref", secretId: secret.id, version: "latest" }) as EnvBinding);
+    let alreadyApplied = false;
     if (namespace === "env") {
       const env = { ...asRecord(adapterConfig.env) };
       const existing = env[key];
@@ -710,6 +711,7 @@ export function createSecretProposalsService(db: Db) {
           configPath: proposal.configPath,
         });
       }
+      alreadyApplied = existing !== undefined;
       adapterConfig.env = { ...env, [key]: binding };
     } else {
       const existing = adapterConfig[proposal.configPath];
@@ -719,7 +721,26 @@ export function createSecretProposalsService(db: Db) {
           configPath: proposal.configPath,
         });
       }
+      alreadyApplied = existing !== undefined;
       adapterConfig[proposal.configPath] = binding;
+    }
+    // The target already carries exactly this binding, so the approval changes nothing. Writing
+    // adapterConfig anyway would still reach syncAgentSecretBindings, which replaces every binding
+    // row of the target with a fresh primary key. A low-trust run and an active static lease hold
+    // those ids (allowedBindingIds, context.bindingId), so the rotation revokes access that the
+    // approval never granted and never took away. An approval that changes nothing therefore writes
+    // nothing, which is the guarantee the previous 409 gave.
+    if (alreadyApplied) {
+      await logActivity(txDb, {
+        companyId: proposal.companyId,
+        actorType: "user",
+        actorId: resolvedByUserId,
+        action: "agent.binding.noop",
+        entityType: "agent",
+        entityId: target.id,
+        details: { adapterConfig: false, proposalId: proposal.id, configPath: proposal.configPath },
+      });
+      return;
     }
     const updated = await agentSvc.update(target.id, { adapterConfig }, {
       recordRevision: { createdByUserId: resolvedByUserId, source: "patch" },

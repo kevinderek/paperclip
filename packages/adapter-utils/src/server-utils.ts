@@ -884,8 +884,11 @@ function normalizePaperclipWakeRecovery(
 
 function normalizePaperclipWakeMonitor(value: unknown): PaperclipWakeMonitor | null {
   const monitor = parseObject(value);
-  const notes = asString(monitor.notes, "").trim();
-  if (!notes) return null;
+  // Keep the note exactly as the writer wrote it. Only the emptiness test
+  // trims: a note can carry indentation, a trailing tab, or a code block, and
+  // the field description promises the prompt renders it verbatim.
+  const notes = asString(monitor.notes, "");
+  if (!notes.trim()) return null;
   return {
     notes,
     nextCheckAt: asString(monitor.nextCheckAt, "").trim() || null,

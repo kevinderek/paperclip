@@ -960,6 +960,19 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).not.toContain("executionPolicy.monitor.notes");
   });
 
+  it("keeps the monitor note verbatim, including the whitespace inside it", () => {
+    const notes = "  alpha\n    indented beta  \n\n  gamma\t";
+    const prompt = renderPaperclipWakePrompt({
+      ...monitorWake,
+      monitor: { ...monitorWake.monitor, notes },
+    });
+    // The renderer adds two spaces of its own to every non-blank line, so a
+    // line that keeps its own leading and trailing whitespace proves the note
+    // was not trimmed on the way in.
+    expect(prompt).toContain("  alpha\n      indented beta  \n");
+    expect(prompt).toContain("  gamma\t");
+  });
+
   it("leaves conversation disposition and accepted-plan handoff to the injected chat policy", () => {
     const payload = {
       reason: "issue_commented",

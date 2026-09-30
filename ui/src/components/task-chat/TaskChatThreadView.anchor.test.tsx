@@ -45,6 +45,15 @@ function placeholder(runId: string): TaskChatItem {
   };
 }
 
+function errorRow(runId: string): TaskChatItem {
+  return {
+    id: `${runId}:transcript-placeholder`,
+    kind: "transcript_placeholder",
+    runId,
+    state: "error",
+  };
+}
+
 function resolvedTurn(runId: string): TaskChatItem {
   return {
     id: `${runId}:turn`,
@@ -104,4 +113,18 @@ it("leaves message anchors on their own render key", () => {
   render([withKey, placeholder("run-1")]);
 
   expect(anchors()[0]).toBe("optimistic-m1");
+});
+
+it("gives an error row its own anchor next to the turn it does not replace", () => {
+  // A run with partial entries and a failed later read renders the settled turn
+  // AND the error row, at the same chronological position. The error row is not
+  // replaced by the turn, so it must not borrow the turn's anchor: two rows on
+  // one anchor means React can reconcile the wrong one and the scroll holder can
+  // correct against the wrong position.
+  render([resolvedTurn("run-1"), errorRow("run-1"), message("m1", "below")]);
+
+  const rows = anchors();
+  expect(rows.filter((anchor) => anchor === "run-1:turn")).toHaveLength(1);
+  expect(new Set(rows).size).toBe(rows.length);
+  expect(rows).toContain("run-1:transcript-placeholder");
 });

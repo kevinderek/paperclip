@@ -331,6 +331,76 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
         : transcriptState.retriedRunIds,
     ).toEqual(["started-run"]);
   });
+
+  // A run with entries from an earlier read, whose later read failed. The
+  // thread-level Retry no longer refetches logs, so without an error row this
+  // reader gets a partial transcript with no notice and no way to re-read.
+  it("keeps the error row for a run that already has partial entries", () => {
+    const props = {
+      issueId: "issue-1",
+      comments: createLongThreadComments(),
+      onAdd: async () => {},
+      linkedRuns: [
+        retryRun,
+        {
+          ...retryRun,
+          runId: "started-run",
+          status: "succeeded" as const,
+          startedAt: "2026-08-25T18:00:00.000Z",
+        },
+      ],
+    };
+    hydrate("started-run");
+    errorsFor("started-run");
+    const partialEntries = runtimeMode === "native"
+      ? nativeRunEventsToTranscript([{ type: "message", text: "partial output" }] as unknown as HeartbeatRunEvent[])
+      : [{ kind: "message", text: "partial output", timestamp: 1 }];
+    if (runtimeMode === "native") {
+      nativeTranscriptState.transcriptByRun.set("started-run", partialEntries);
+    } else {
+      transcriptState.transcriptByRun.set("started-run", partialEntries);
+    }
+    render(<TaskChatThread {...props} />);
+
+    expect(
+      container.querySelector('[data-testid="transcript-slot-error-started-run"]'),
+    ).not.toBeNull();
+    const row = container.querySelector(
+      '[data-testid="transcript-slot-error-started-run"]',
+    );
+    const retry = Array.from(row!.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Retry",
+    );
+    flushSync(() => retry!.click());
+    expect(
+      runtimeMode === "native"
+        ? nativeTranscriptState.retriedRunIds
+        : transcriptState.retriedRunIds,
+    ).toEqual(["started-run"]);
+  });
+});
+
+describe("REK-311: the empty state waits for the messages", () => {
+  beforeEach(() => {
+    transcriptState.hydratedRunIds = new Set();
+    nativeTranscriptState.hydratedRunIds = new Set();
+  });
+
+  it("does not claim the conversation is empty while messages are in flight", async () => {
+    const props = { issueId: "empty-issue", comments: [], onAdd: async () => {} };
+    render(<TaskChatThread {...props} initialHistoryPending />);
+    // The thread-level overlay is gone, so nothing else covers this: the empty
+    // state has to wait or the reader is told "No messages yet." too early.
+    expect(
+      container.querySelector('[data-testid="task-chat-history-loading"]'),
+    ).toBeNull();
+    expect(container.textContent).not.toContain("No messages yet.");
+
+    render(<TaskChatThread {...props} initialHistoryPending={false} />);
+    await settleReveal();
+    // Messages loaded and there are none: the claim is true now.
+    expect(container.textContent).toContain("No messages yet.");
+  });
 });
 
 it("preserves the typed disposition notice through the task-chat adapter", () => {

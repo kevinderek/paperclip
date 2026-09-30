@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../../api/client";
@@ -266,6 +267,82 @@ describe("useLiveRunTranscripts", () => {
     } finally {
       act(() => root.unmount());
       vi.useRealTimers();
+    }
+  });
+
+  // REK-311: a per-run retry bumps `retryGeneration`, which runs the effect
+  // cleanup and aborts the shared AbortController. Terminal runs are not
+  // polled, so a read that was in flight at that moment has to be picked up by
+  // the next pass. Scoping the retry to one run must not strand the other.
+  it("re-reads runs a scoped retry interrupted, without fanning out to settled ones", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    let resolveStalled!: (result: Awaited<ReturnType<typeof logMock>>) => void;
+    const stalled = { runId: "run-stalled", store: "memory", logRef: "l", content: "", nextOffset: 0 };
+    const runs = [
+      { id: "run-broken", status: "succeeded" as const, adapterType: "codex_local" },
+      { id: "run-settled", status: "succeeded" as const, adapterType: "codex_local" },
+      { id: "run-stalled", status: "succeeded" as const, adapterType: "codex_local" },
+    ];
+    const logResult = (runId: string) => ({
+      runId,
+      store: "memory",
+      logRef: "log-1",
+      content: "",
+      nextOffset: 0,
+    });
+    // run-broken fails; run-settled succeeds at once; run-stalled never settles.
+    logMock.mockImplementation(async (...args: unknown[]) => {
+      const runId = args[0] as string;
+      if (runId === "run-stalled") {
+        return new Promise((resolve) => {
+          resolveStalled = resolve as (value: ReturnType<typeof logResult>) => void;
+        });
+      }
+      if (runId === "run-broken") throw new Error("boom");
+      return logResult(runId);
+    });
+    function Harness() {
+      latest = useLiveRunTranscripts({ companyId: "company-1", runs, enableRealtimeUpdates: false });
+      return null;
+    }
+    // `act`-free on purpose: the installed react build exports it as undefined
+    // under the react-server condition vitest 4 applies, which is why every
+    // other test in this file fails in that container. A macrotask is the
+    // smallest wait that lets the read promise resolve AND React commit the
+    // state update; microtask ticks alone are not enough.
+    const settle = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+    try {
+      flushSync(() => root.render(<Harness />));
+      await settle();
+      expect(latest.hydratedRunIds?.has("run-settled")).toBe(true);
+      expect(latest.hydratedRunIds?.has("run-stalled")).toBe(false);
+      const before = logMock.mock.calls.length;
+
+      logMock.mockImplementation(async (...args: unknown[]) =>
+        logResult(args[0] as string),
+      );
+      flushSync(() => latest.retry("run-broken"));
+      await settle();
+
+      // The interrupted read is retried, so its row cannot stay "Loading".
+      expect(latest.hydratedRunIds?.has("run-stalled")).toBe(true);
+      // And the run that had already settled is not re-read: the retry stays
+      // scoped, it does not become one request per run on the issue.
+      const reRead = logMock.mock.calls
+        .slice(before)
+        .map((call) => (call as unknown as [string])[0]);
+      expect(reRead).toContain("run-broken");
+      expect(reRead).toContain("run-stalled");
+      expect(reRead).not.toContain("run-settled");
+      resolveStalled(stalled);
+      await settle();
+    } finally {
+      // No `act` in the teardown, for the same reason as above.
+      root.unmount();
     }
   });
 

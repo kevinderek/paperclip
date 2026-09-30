@@ -382,13 +382,21 @@ export function useLiveRunTranscripts({
       }
     };
 
-    // A scoped retry (REK-311) re-reads only the run whose row asked for it —
-    // one request, not one per run on the issue. The recurring poll below keeps
-    // covering every run, so the scope never narrows live updates.
+    // A scoped retry (REK-311) re-reads the run whose row asked for it, and does
+    // not fan out to one request per run on the issue. It still has to pick up
+    // the reads this restart interrupted: bumping `retryGeneration` runs the
+    // cleanup below, which aborts the shared AbortController, and only a
+    // completed read marks its run hydrated (the `finally` skips that on an
+    // abort). Terminal runs are not polled, so an unhydrated run would keep its
+    // "Loading" row forever. `!hydratedRunIds.has(run.id)` is exactly that set.
+    // The recurring poll below keeps covering every run, so the scope never
+    // narrows live updates.
     const retryScope = retryRunIdsRef.current;
     retryRunIdsRef.current = null;
     const initialTargets = retryScope
-      ? readableRuns.filter((run) => retryScope.has(run.id))
+      ? readableRuns.filter(
+          (run) => retryScope.has(run.id) || !hydratedRunIds.has(run.id),
+        )
       : readableRuns;
     if (initialTargets.length > 0) {
       void Promise.all(initialTargets.map((run) => readRunLog(run)));

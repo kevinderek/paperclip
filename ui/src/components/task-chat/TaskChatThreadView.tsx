@@ -295,6 +295,24 @@ export function taskChatItemSpacingClass(
 }
 
 /**
+ * Stable identity for a rendered row, used as the React key and as
+ * `data-thread-anchor`. The scroll holder matches on this value, so it has to
+ * survive a row being replaced in place.
+ *
+ * A transcript placeholder and the settled turn it resolves into are one
+ * logical row with two item ids (`<runId>:transcript-placeholder` and
+ * `<runId>:turn`). Keying the placeholder on the id of the row that replaces
+ * it means the holder keeps a match across the swap, so a transcript that
+ * grows above the reader is still corrected. Without this, a placeholder that
+ * was the first visible row leaves the holder with no anchor to correct and
+ * the messages below it move instead.
+ */
+function threadAnchorId(item: TaskChatItem): string {
+  if (item.kind === "transcript_placeholder") return `${item.runId}:turn`;
+  return item.kind === "message" ? (item.renderKey ?? item.id) : item.id;
+}
+
+/**
  * Presentational render layer for the redesigned task thread. Consumed by both
  * the live thread (adapter over comment/run props) and the dev harness
  * (synthetic fixtures). Owns no data fetching — it maps a normalized
@@ -366,12 +384,8 @@ export function TaskChatThreadView({
         {streamlined
           ? renderedItems.map(({ item, content }, index) => (
               <div
-                key={
-                  item.kind === "message" ? (item.renderKey ?? item.id) : item.id
-                }
-                data-thread-anchor={
-                  item.kind === "message" ? (item.renderKey ?? item.id) : item.id
-                }
+                key={threadAnchorId(item)}
+                data-thread-anchor={threadAnchorId(item)}
                 id={item.kind === "message" ? `comment-${item.id}` : undefined}
                 className={taskChatItemSpacingClass(
                   item,
@@ -386,12 +400,8 @@ export function TaskChatThreadView({
             ))
           : items.map((item, index) => (
               <div
-                key={
-                  item.kind === "message" ? (item.renderKey ?? item.id) : item.id
-                }
-                data-thread-anchor={
-                  item.kind === "message" ? (item.renderKey ?? item.id) : item.id
-                }
+                key={threadAnchorId(item)}
+                data-thread-anchor={threadAnchorId(item)}
                 id={item.kind === "message" ? `comment-${item.id}` : undefined}
                 className={cn(
                   index > 0 &&

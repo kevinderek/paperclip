@@ -1421,15 +1421,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     if (run.status === "scheduled_retry") return "ready";
     if (run.runtimeMode === "native") {
       const hasEntries = (transcriptByRun.get(run.id)?.length ?? 0) > 0;
-      if (!hasEntries && nativeTranscriptErrorsByRun.has(run.id)) return "error";
+      // An error on a run that already has entries still belongs on its row.
+      // The thread-level Retry no longer refetches logs, so a silent partial
+      // transcript would leave the reader with no notice and no way to re-read.
+      if (nativeTranscriptErrorsByRun.has(run.id)) return "error";
       const hydrating = hydratedNativeRunIds
         ? !hydratedNativeRunIds.has(run.id)
         : nativeEventsAreInitiallyHydrating;
       return hydrating ? "loading" : "ready";
     }
-    if (logErrorsByRun?.has(run.id) && (transcriptByRun.get(run.id)?.length ?? 0) === 0) {
-      return "error";
-    }
+    if (logErrorsByRun?.has(run.id)) return "error";
     const hydrating =
       run.status !== "queued" && hydratedLogRunIds
         ? !hydratedLogRunIds.has(run.id)
@@ -2054,10 +2055,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // A run that already shows transcript entries is skipped, so the placeholder
     // is always REPLACED by the transcript rather than sitting beside it.
     for (const source of runs) {
-      if ((transcriptByRun.get(source.id)?.length ?? 0) > 0) continue;
-      if (liveRun && source.id === liveRun.id) continue;
       const state = transcriptSlotStates.get(source.id);
       if (state !== "loading" && state !== "error") continue;
+      // A run that already shows transcript entries is skipped, so the
+      // placeholder is always REPLACED by the transcript rather than sitting
+      // beside it. An error row is the exception: it is a notice, not a
+      // placeholder, and it is the only way to re-read a partial transcript
+      // now that the thread-level Retry no longer touches logs.
+      if (state === "loading" && (transcriptByRun.get(source.id)?.length ?? 0) > 0) {
+        continue;
+      }
+      if (liveRun && source.id === liveRun.id) continue;
       const meta = linkedRunMetaById.get(source.id);
       const startMs = toMs(meta?.startedAt ?? meta?.createdAt);
       settledTurns.push({
@@ -2853,7 +2861,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                   !isMobile && "min-h-0 flex-1",
                 )}
               >
-                {items.length === 0 && !tailRunId ? (
+                {/* REK-311: the empty state is a claim about the conversation,
+                    so it waits for the message load. The thread-level overlay
+                    that used to cover this is gone, and without the gate a
+                    reader would be told "No messages yet." before the messages
+                    arrive. `historyRevealed` is latched per issue, so this
+                    cannot flip back on a later refetch. */}
+                {items.length === 0 && !tailRunId && historyRevealed ? (
                   <div
                     className={
                       isMobile ? undefined : "min-h-0 flex-1 overflow-y-auto"

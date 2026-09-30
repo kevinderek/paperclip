@@ -128,10 +128,17 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
         timers.add(timer);
       }
     };
+    // A scoped retry reads the run whose row asked for it, plus the reads this
+    // restart interrupted: bumping `retryGeneration` runs the cleanup below,
+    // which aborts the shared controller, and line 122 only marks a run
+    // hydrated on a completed read. A terminal run is not polled afterwards, so
+    // an unhydrated run would keep its "Loading" row forever.
     const retryScope = retryRunIdsRef.current;
     retryRunIdsRef.current = null;
     for (const run of nativeRuns) {
-      if (retryScope && !retryScope.has(run.id)) continue;
+      if (retryScope && !retryScope.has(run.id) && hydratedRunIds.has(run.id)) {
+        continue;
+      }
       void refreshRun(run);
     }
     return () => {

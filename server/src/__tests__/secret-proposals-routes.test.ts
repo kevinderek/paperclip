@@ -221,6 +221,29 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     return app;
   }
 
+  async function proposeLiveSecretBinding(
+    fixture: Awaited<ReturnType<typeof seedRun>>,
+    input: { secretId: string; configPath: string },
+  ) {
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: input.secretId,
+        configPath: input.configPath,
+        justification: "Bind an approved secret to an agent config path",
+      });
+    expect(proposed.status).toBe(201);
+    return proposed;
+  }
+
+  async function readStoredEnvBinding(agentId: string, envKey: string): Promise<unknown> {
+    // jsonb does not preserve key order, so a stored binding is only comparable on semantics.
+    const [row] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const env = (row?.adapterConfig as Record<string, unknown> | null)?.env;
+    return (env as Record<string, unknown> | null | undefined)?.[envKey];
+  }
+
   it("requires company admin access to reject secret proposals", async () => {
     const fixture = await seedRun();
     const proposed = await request(createAgentApp(fixture))
@@ -521,6 +544,136 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         configPath: "env.SEQUENTIAL_TOKEN",
       }),
     ]);
+  });
+
+  it("applies an identical rebinding as a no-op instead of rejecting it as a conflict", async () => {
+    const fixture = await seedRun();
+    const boardApp = createBoardApp(fixture);
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "dev/rebind/idempotent",
+      key: "REBIND_IDEMPOTENT",
+      provider: "local_encrypted",
+      value: "rebind-idempotent-secret",
+    });
+
+    const first = await proposeLiveSecretBinding(fixture, {
+      secretId: liveSecret.id,
+      configPath: "env.REBIND_IDEMPOTENT",
+    });
+    const firstApproved = await request(boardApp)
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${first.body.id}/approve`)
+      .send({});
+    expect(firstApproved.status).toBe(200);
+
+    // The stored form is the canonical (defaulted) five-key binding, while the proposal carries the
+    // three-key shape. Both describe the same binding, so a second proposal must not read as a conflict.
+    const stored = await readStoredEnvBinding(fixture.agentId, "REBIND_IDEMPOTENT");
+    expect(stored).toEqual({
+      type: "secret_ref",
+      secretId: liveSecret.id,
+      version: "latest",
+      projectionClass: "unclassified",
+      projectionAllowlistKey: null,
+    });
+
+    const second = await proposeLiveSecretBinding(fixture, {
+      secretId: liveSecret.id,
+      configPath: "env.REBIND_IDEMPOTENT",
+    });
+    const secondApproved = await request(boardApp)
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${second.body.id}/approve`)
+      .send({});
+
+    expect(secondApproved.status).toBe(200);
+    expect(secondApproved.body).toMatchObject({
+      status: "approved",
+      appliedBindingConfigPath: "env.REBIND_IDEMPOTENT",
+    });
+    expect(await readStoredEnvBinding(fixture.agentId, "REBIND_IDEMPOTENT")).toEqual(stored);
+    expect(await db.select().from(companySecretBindings)
+      .where(eq(companySecretBindings.configPath, "env.REBIND_IDEMPOTENT"))).toHaveLength(1);
+  });
+
+  it("still rejects a rebinding that points at a different secret on the same config path", async () => {
+    const fixture = await seedRun();
+    const boardApp = createBoardApp(fixture);
+    const firstSecret = await secretService(db).create(fixture.companyId, {
+      name: "dev/rebind/first-secret",
+      key: "REBIND_FIRST",
+      provider: "local_encrypted",
+      value: "rebind-first-secret",
+    });
+    const secondSecret = await secretService(db).create(fixture.companyId, {
+      name: "dev/rebind/second-secret",
+      key: "REBIND_SECOND",
+      provider: "local_encrypted",
+      value: "rebind-second-secret",
+    });
+    const first = await proposeLiveSecretBinding(fixture, {
+      secretId: firstSecret.id,
+      configPath: "env.REBIND_SECOND",
+    });
+    expect((await request(boardApp)
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${first.body.id}/approve`)
+      .send({})).status).toBe(200);
+
+    const conflicting = await proposeLiveSecretBinding(fixture, {
+      secretId: secondSecret.id,
+      configPath: "env.REBIND_SECOND",
+    });
+    const rejected = await request(boardApp)
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${conflicting.body.id}/approve`)
+      .send({});
+
+    expect(rejected.status).toBe(409);
+    expect(rejected.body).toMatchObject({
+      error: "Agent config path already exists: env.REBIND_SECOND",
+      code: "agent_config_path_conflict",
+    });
+    expect(await readStoredEnvBinding(fixture.agentId, "REBIND_SECOND")).toMatchObject({
+      secretId: firstSecret.id,
+    });
+    expect(await db.select().from(companySecretProposals)
+      .where(eq(companySecretProposals.id, conflicting.body.id)))
+      .toEqual([expect.objectContaining({ status: "pending" })]);
+  });
+
+  it("still rejects a rebinding that changes the binding type on the same config path", async () => {
+    const fixture = await seedRun();
+    const boardApp = createBoardApp(fixture);
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "dev/rebind/type-change",
+      key: "REBIND_TYPE_CHANGE",
+      provider: "local_encrypted",
+      value: "rebind-type-secret",
+    });
+    await db.update(agents)
+      .set({
+        adapterConfig: {
+          env: {
+            REBIND_TYPE_CHANGE: { type: "user_secret_ref", key: "other.user.key" },
+          },
+        },
+      })
+      .where(eq(agents.id, fixture.agentId));
+
+    const proposal = await proposeLiveSecretBinding(fixture, {
+      secretId: liveSecret.id,
+      configPath: "env.REBIND_TYPE_CHANGE",
+    });
+    const rejected = await request(boardApp)
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${proposal.body.id}/approve`)
+      .send({});
+
+    expect(rejected.status).toBe(409);
+    expect(rejected.body).toMatchObject({
+      error: "Agent config path already exists: env.REBIND_TYPE_CHANGE",
+      code: "agent_config_path_conflict",
+    });
+    expect(await readStoredEnvBinding(fixture.agentId, "REBIND_TYPE_CHANGE")).toMatchObject({
+      type: "user_secret_ref",
+      key: "other.user.key",
+    });
   });
 
   it("proposes and approves a binding by resolving the proposer's own sourceConfigPath", async () => {

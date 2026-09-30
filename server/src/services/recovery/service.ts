@@ -3039,10 +3039,54 @@ export function recoveryService(
     });
   }
 
+  // `outcome IS NULL` means the escalation is still standing. `cancelled` means
+  // the row was voided without a decision, which is what a reopen does. Every
+  // other outcome in ISSUE_RECOVERY_ACTION_OUTCOMES is somebody settling the
+  // notice, so those must not keep seeding a spent budget: a new value added
+  // there later counts as a decision instead of silently reviving the loop.
+  async function seedExhaustedSourceStateAttempt(
+    companyId: string,
+    issueId: string,
+    sourceStateFingerprint: string,
+    maxAttempts: number,
+  ) {
+    const rows = await db
+      .select({
+        evidence: issueRecoveryActions.evidence,
+        attemptCount: issueRecoveryActions.attemptCount,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+          eq(issueRecoveryActions.kind, "deliberate_wait_without_target"),
+          sql`${issueRecoveryActions.evidence} ->> 'terminalReason' = 'unchanged_source_state_exhausted'`,
+          sql`${issueRecoveryActions.evidence} ->> 'sourceStateFingerprint' = ${sourceStateFingerprint}`,
+          or(
+            isNull(issueRecoveryActions.outcome),
+            eq(issueRecoveryActions.outcome, "cancelled"),
+          ),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt))
+      .limit(1);
+    const [row] = rows;
+    if (!row) return 0;
+    const evidence = row.evidence as Record<string, unknown> | null;
+    const recorded = Math.floor(
+      asNumber(evidence?.sourceAttemptCount, row.attemptCount),
+    );
+    // The recorded count can never lower a spent budget; a write that left it
+    // below the ceiling still means this digest already exhausted its attempts.
+    return recorded >= maxAttempts ? recorded : maxAttempts;
+  }
+
   async function ensureDispositionRepairAction(input: {
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     fingerprint: string;
+    sourceStateFingerprint?: string;
     attemptCount: number;
     legacyEpisode?: LegacyDispositionEpisode;
   }) {
@@ -3100,7 +3144,7 @@ export function recoveryService(
         latestRunId: input.latestRun?.id ?? null,
         latestRunStatus: input.latestRun?.status ?? null,
         latestRunErrorCode: input.latestRun?.errorCode ?? null,
-        sourceStateFingerprint: input.fingerprint,
+        sourceStateFingerprint: input.sourceStateFingerprint ?? input.fingerprint,
         terminalReason: null,
       },
       nextAction:
@@ -3122,6 +3166,7 @@ export function recoveryService(
     latestRun: LatestIssueRun;
     action: Awaited<ReturnType<typeof ensureDispositionRepairAction>>;
     fingerprint: string;
+    sourceStateFingerprint?: string;
     attempt: number;
     legacyEpisode?: LegacyDispositionEpisode;
   }) {
@@ -3318,7 +3363,7 @@ export function recoveryService(
           sourceIssueId: input.issue.id,
           sourceIdentifier: input.issue.identifier,
           ownerAgentId: agentId,
-          sourceStateFingerprint: input.fingerprint,
+          sourceStateFingerprint: input.sourceStateFingerprint ?? input.fingerprint,
           attempt: input.attempt,
           maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
           baseBackoffMs: timing.baseDelayMs,
@@ -3543,6 +3588,7 @@ export function recoveryService(
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     fingerprint: string;
+    sourceStateFingerprint?: string;
     attemptCount: number;
     terminalReason: string;
     legacyEpisode?: LegacyDispositionEpisode;
@@ -3551,6 +3597,7 @@ export function recoveryService(
       issue: input.issue,
       latestRun: input.latestRun,
       fingerprint: input.fingerprint,
+      sourceStateFingerprint: input.sourceStateFingerprint,
       attemptCount: input.attemptCount,
       legacyEpisode: input.legacyEpisode,
     });
@@ -3568,6 +3615,11 @@ export function recoveryService(
           latestRunId: input.latestRun?.id ?? null,
           latestRunStatus: input.latestRun?.status ?? null,
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          // The durable digest, never the per-episode fingerprint: this field is
+          // what a later sweep matches on to decide whether the budget for this
+          // unchanged source state is already spent.
+          sourceStateFingerprint: input.sourceStateFingerprint ?? input.fingerprint,
+          episodeFingerprint: input.fingerprint,
           terminalReason: input.terminalReason,
           sourceAttemptCount: input.attemptCount,
           sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -3650,7 +3702,8 @@ export function recoveryService(
         identifier: input.issue.identifier,
         status: "blocked",
         previousStatus: input.issue.status,
-        sourceStateFingerprint: input.fingerprint,
+        sourceStateFingerprint: input.sourceStateFingerprint ?? input.fingerprint,
+        episodeFingerprint: input.fingerprint,
         attemptCount: input.attemptCount,
         maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
         terminalReason: input.terminalReason,
@@ -3795,6 +3848,13 @@ export function recoveryService(
     const state = await collectDispositionRepairSourceState(db, {
       issue: current,
     });
+    // The episode id is per repair attempt, the digest is per durable source
+    // state. Keep the digest next to the episode fingerprint instead of
+    // replacing it: a comment that reopens the issue mints a fresh episode, and
+    // a budget anchored on the episode id can therefore never run out. The
+    // digest is what stays equal across that reopening, so it is what the
+    // exhausted-budget seed below has to match on.
+    const sourceStateFingerprint = state.fingerprint;
     if (episode) {
       if (!latestRun) return "skipped";
       const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
@@ -3842,6 +3902,18 @@ export function recoveryService(
       maxAttempts,
       Math.max(episode?.attempt ?? 0, Math.floor(options.historicalAttemptCount ?? 0)),
     );
+    // A reopen that changes nothing durable cancels the active action before the
+    // next sweep sees it, so neither runAttempt nor persistedAttempt survives the
+    // reopening. Seed the counter from the escalation that already happened
+    // against this same digest: without it a comment hands the same unchanged
+    // source state a complete fresh budget, which is the reopen loop. The anchor
+    // is the digest, so any durable change still earns a fresh budget.
+    const exhaustedAttempt = await seedExhaustedSourceStateAttempt(
+      current.companyId,
+      current.id,
+      sourceStateFingerprint,
+      maxAttempts,
+    );
     // A source run owns one successor slot. Concurrent checks must not advance
     // the counter again after another checker reserved that same successor.
     if (episode && persistedAttempt > episode.attempt) return "skipped";
@@ -3849,6 +3921,7 @@ export function recoveryService(
       runAttempt,
       persistedAttempt,
       historicalAttempt,
+      exhaustedAttempt,
     );
     if (episode && (!ownerInvokable || budgetBlocked)) return "skipped";
     if (!ownerInvokable || budgetBlocked) {
@@ -3856,6 +3929,7 @@ export function recoveryService(
         issue: current,
         latestRun,
         fingerprint: state.fingerprint,
+        sourceStateFingerprint,
         attemptCount: sameFingerprintAttempt,
         terminalReason: !ownerInvokable
           ? "owner_not_invokable"
@@ -3869,6 +3943,7 @@ export function recoveryService(
         issue: current,
         latestRun,
         fingerprint: state.fingerprint,
+        sourceStateFingerprint,
         attemptCount: sameFingerprintAttempt,
         terminalReason: "unchanged_source_state_exhausted",
         legacyEpisode: episode,
@@ -3881,6 +3956,7 @@ export function recoveryService(
       issue: current,
       latestRun,
       fingerprint: state.fingerprint,
+      sourceStateFingerprint,
       attemptCount: sameFingerprintAttempt,
       legacyEpisode: episode,
     });
@@ -3889,6 +3965,7 @@ export function recoveryService(
       latestRun,
       action,
       fingerprint: state.fingerprint,
+      sourceStateFingerprint,
       attempt: nextAttempt,
       legacyEpisode: episode,
     });

@@ -1132,6 +1132,50 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  // The negative control for the disposition-repair budget rule: a comment on a
+  // healthy done issue must keep reopening it. Without this, "a reopen buys no
+  // fresh budget" would be indistinguishable from "a reopen is forbidden".
+  it("reopens a done issue that has no recovery action via POST comments", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+      }),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "one more thing" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_reopened_via_comment",
+          payload: expect.objectContaining({
+            commentId: "comment-1",
+            reopenedFrom: "done",
+            mutation: "comment",
+          }),
+          contextSnapshot: expect.objectContaining({
+            issueId: "11111111-1111-4111-8111-111111111111",
+            wakeCommentId: "comment-1",
+            wakeReason: "issue_reopened_via_comment",
+            reopenedFrom: "done",
+          }),
+        }),
+      ),
+    );
+  });
+
   it("moves in-progress issues with a scheduled retry back to todo via POST human comments", async () => {
     const issue = {
       ...makeIssue("in_progress"),

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { IssueBlockerAttention } from "@paperclipai/shared";
 import { cn } from "../lib/utils";
+import { BLOCKED_STATUS_LABEL, issueStatusLabelOverride } from "../lib/issue-status-labels";
 import { StatusGlyph, type StatusGlyphSize } from "./StatusGlyph";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
@@ -8,6 +9,8 @@ import { Button } from "@/components/ui/button";
 const allStatuses = ["backlog", "todo", "in_progress", "in_review", "done", "cancelled", "blocked"];
 
 function statusLabel(status: string): string {
+  const renamed = issueStatusLabelOverride(status);
+  if (renamed) return renamed;
   return status.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
@@ -25,7 +28,9 @@ interface StatusIconProps {
 }
 
 function blockedAttentionLabel(blockerAttention: IssueBlockerAttention | null | undefined) {
-  if (!blockerAttention || blockerAttention.state === "none") return "Blocked";
+  // Zonder aandachtsreden staat hier de statusnaam zelf; met een reden begint de
+  // zin met het woord "Blocked" als diagnose van de blokkade, niet als statuslabel.
+  if (!blockerAttention || blockerAttention.state === "none") return BLOCKED_STATUS_LABEL;
 
   if (blockerAttention.reason === "active_child") {
     const count = blockerAttention.coveredBlockerCount;
@@ -63,7 +68,7 @@ function blockedAttentionLabel(blockerAttention: IssueBlockerAttention | null | 
     return `Blocked · ${attentionCopy}`;
   }
 
-  return "Blocked";
+  return BLOCKED_STATUS_LABEL;
 }
 
 /**

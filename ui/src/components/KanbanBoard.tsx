@@ -26,6 +26,7 @@ import type { Issue, IssueStatus } from "@paperclipai/shared";
 import { AlertTriangle } from "lucide-react";
 import { isSuccessfulRunHandoffRequired } from "../lib/successful-run-handoff";
 import { collectSubtreeLiveCounts } from "../lib/liveIssueIds";
+import { issueStatusLabelOverride } from "../lib/issue-status-labels";
 import { cn } from "../lib/utils";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -132,6 +133,8 @@ export function getKanbanColumnTone(status: IssueStatus) {
 }
 
 function statusLabel(status: string): string {
+  const renamed = issueStatusLabelOverride(status);
+  if (renamed) return renamed;
   return status.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 

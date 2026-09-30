@@ -1,4 +1,5 @@
 import type { DashboardRunActivityDay, HeartbeatRun } from "@paperclipai/shared";
+import { BLOCKED_STATUS_LABEL } from "../lib/issue-status-labels";
 
 /* ---- Utilities ---- */
 
@@ -241,7 +242,7 @@ const statusLabels: Record<string, string> = {
   in_progress: "In Progress",
   in_review: "In Review",
   done: "Done",
-  blocked: "Blocked",
+  blocked: BLOCKED_STATUS_LABEL,
   cancelled: "Cancelled",
   backlog: "Backlog",
 };

@@ -11,6 +11,7 @@ import {
 import { StatusIcon } from "@/components/StatusIcon";
 import { PriorityIcon } from "@/components/PriorityIcon";
 import { SHOW_TASK_PRIORITY_UI } from "@/lib/ui-flags";
+import { issueStatusLabelOverride } from "@/lib/issue-status-labels";
 import { SearchFilterMenu, type FilterMenuOption } from "./SearchFilterMenu";
 import { SearchSortMenu } from "./SearchSortMenu";
 import {
@@ -74,7 +75,7 @@ export function buildSearchFilterOptions({
 }: SearchFilterDataProps): SearchFilterOptionGroups {
   const status: FilterMenuOption[] = ISSUE_STATUSES.map((value) => ({
     value,
-    label: humanize(value),
+    label: issueStatusLabelOverride(value) ?? humanize(value),
     icon: <StatusIcon status={value} />,
     count: count(counts?.status as Record<string, number> | undefined, value),
   }));

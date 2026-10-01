@@ -22,8 +22,17 @@
 set -euo pipefail
 
 INSTANTIE="${INSTANTIE:-https://paperclip.kevinderek.com}"
+# Met een argument is de commit-poort een harde poort. Zonder argument is hij
+# een waarschuwing, en dat is een bewuste keuze: dit script staat in de repo en
+# de repo bevat per definitie commits die nog niet live zijn. Wie het zonder
+# argument draait, vraagt één ding — staat de parkeerstap in de bezorgde UI — en
+# de UI-meting hieronder is het bewijs. De commit er precies bij tellen zou na
+# elke uitrol van een meetbestand een valse rode opleveren.
+HARD=false
 VERWACHT="${1:-}"
-if [ -z "$VERWACHT" ]; then
+if [ -n "$VERWACHT" ]; then
+  HARD=true
+else
   VERWACHT="$(git -C "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" rev-parse HEAD 2>/dev/null || true)"
 fi
 [ -n "$VERWACHT" ] || { printf 'geen verwachte commit meegegeven en geen bron om HEAD uit te halen\n' >&2; exit 2; }
@@ -41,10 +50,14 @@ GEMELDEN="$(printf '%s' "$HEALTH" | sed -n 's/.*"commit":"\([0-9a-f]\{7,40\}\)".
 echo "  gemeten  : ${GEMELDEN:-geen}"
 echo "  verwacht : $VERWACHT"
 if [ "$GEMELDEN" != "$VERWACHT" ]; then
-  rood "De bezorgde instance draait $GEMELDEN, niet $VERWACHT. De uitrol is niet afgerond."
-  exit 1
+  if [ "$HARD" = true ]; then
+    rood "De bezorgde instance draait $GEMELDEN, niet $VERWACHT. De uitrol is niet afgerond."
+    exit 1
+  fi
+  printf '\033[33m%s\033[0m\n' "Let op: de instance draait $GEMELDEN, deze script staat op $VERWACHT. Dat is geen fout zolang de parkeerstap hieronder wel gevonden wordt."
+else
+  groen "de bezorgde instance noemt $GEMELDEN"
 fi
-groen "de bezorgde instance noemt $GEMELDEN"
 
 kop "2. Welke UI-chunk hoort bij de statusknop?"
 INDEX="$(curl -fsS --max-time 20 "$INSTANTIE/" || echo '')"

@@ -6905,7 +6905,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       status={issue.status} externalConversationState={issue.externalConversationState}
       size="lg"
       blockerAttention={issue.blockerAttention}
-      onChange={(status) => updateIssue.mutate({ status })}
+      onChange={(status, extras) => updateIssue.mutate({ status, ...extras })}
+      issueLabel={issue.identifier}
     />
   );
 

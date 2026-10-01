@@ -16,6 +16,8 @@ import { IssuesList } from "../components/IssuesList";
 import { CircleDot } from "lucide-react";
 import type { Issue } from "@paperclipai/shared";
 import { useStreamlinedUiEnabled } from "../hooks/useStreamlinedUiEnabled";
+import { useOptionalToastActions } from "../context/ToastContext";
+import { parkErrorMessage } from "../lib/park-issue";
 
 const WORKSPACE_FILTER_ISSUE_LIMIT = 1000;
 const ISSUES_PAGE_SIZE = 100;
@@ -67,6 +69,7 @@ export function buildIssuesSearchUrl(currentHref: string, search: string): strin
 
 export function Issues() {
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
+  const toast = useOptionalToastActions();
   const issuesPresentation = resolveIssuesPresentation(streamlinedUiEnabled);
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -194,6 +197,16 @@ export function Issues() {
       issuesApi.update(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(selectedCompanyId!) });
+    },
+    // Zonder deze tak faalt een afgewezen statuswijziging stil: de kaart springt
+    // terug en er is niets te zien. De 422 op `blocked` is dan een onvindbaar
+    // nietsverkeerd, dus de servertékst gaat ongefilterd in de toast.
+    onError: (error) => {
+      toast?.pushToast({
+        title: "Status change failed",
+        body: parkErrorMessage(error),
+        tone: "error",
+      });
     },
   });
 

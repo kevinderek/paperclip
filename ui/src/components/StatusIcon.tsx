@@ -2,11 +2,27 @@ import { useState } from "react";
 import type { IssueBlockerAttention } from "@paperclipai/shared";
 import { cn } from "../lib/utils";
 import { BLOCKED_STATUS_LABEL, issueStatusLabelOverride } from "../lib/issue-status-labels";
+import type { ParkIssuePatch } from "../lib/park-issue";
+import { ParkIssueDialog } from "./ParkIssueDialog";
 import { StatusGlyph, type StatusGlyphSize } from "./StatusGlyph";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
 
 const allStatuses = ["backlog", "todo", "in_progress", "in_review", "done", "cancelled", "blocked"];
+
+/** De waarde waarop de server een parkeerstap afdwingt: `blocked` blijft `blocked`. */
+const PARKED_STATUS = "blocked";
+
+/**
+ * Extra velden die de picker meestuurt naast de status. Alleen de
+ * parkeerstap levert iets mee: `unblockDescriptor` is de escape die de server
+ * al accepteert (`createIssueBaseSchema`), zodat een mens een taak zelf in "In
+ * afwachting" kan zetten zonder blokker. De aanroeper plakt dit fragment in
+ * dezelfde PATCH als de status.
+ */
+export interface StatusChangeExtras {
+  unblockDescriptor?: ParkIssuePatch["unblockDescriptor"];
+}
 
 function statusLabel(status: string): string {
   const renamed = issueStatusLabelOverride(status);
@@ -18,13 +34,15 @@ interface StatusIconProps {
   status: string;
   externalConversationState?: "active" | "waiting" | null;
   blockerAttention?: IssueBlockerAttention | null;
-  onChange?: (status: string) => void;
+  onChange?: (status: string, extras?: StatusChangeExtras) => void;
   className?: string;
   /** Optional layout wrapper around the glyph. Does not change glyph dimensions. */
   glyphContainerClassName?: string;
   showLabel?: boolean;
   /** Glyph size (PAP-243a). Default `md` (16px); lists/detail/mentions use `lg` (20px). */
   size?: StatusGlyphSize;
+  /** Issue-titel/-identifier, alleen gebruikt in de titel van de parkeer-dialoog. */
+  issueLabel?: string | null;
 }
 
 function blockedAttentionLabel(blockerAttention: IssueBlockerAttention | null | undefined) {
@@ -83,8 +101,9 @@ function blockedAttentionLabel(blockerAttention: IssueBlockerAttention | null | 
  * glyph — the blocked shape recoloured blue — while the full blocked reason
  * still rides on the accessible label.
  */
-export function StatusIcon({ status, externalConversationState, blockerAttention, onChange, className, glyphContainerClassName, showLabel, size = "md" }: StatusIconProps) {
+export function StatusIcon({ status, externalConversationState, blockerAttention, onChange, className, glyphContainerClassName, showLabel, size = "md", issueLabel }: StatusIconProps) {
   const [open, setOpen] = useState(false);
+  const [parking, setParking] = useState(false);
   const displayStatus = status === "in_review" && externalConversationState === "waiting" ? "idle" : status;
   const isCoveredBlocked = status === "blocked" && blockerAttention?.state === "covered";
   const ariaLabel = status === "blocked" ? blockedAttentionLabel(blockerAttention) : statusLabel(displayStatus);
@@ -136,25 +155,45 @@ export function StatusIcon({ status, externalConversationState, blockerAttention
   );
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>{trigger}</PopoverTrigger>
-      <PopoverContent className="w-40 p-1" align="start">
-        {allStatuses.map((s) => (
-          <Button
-            key={s}
-            variant="ghost"
-            size="sm"
-            className={cn("w-full justify-start gap-2 text-xs", s === status && "bg-accent")}
-            onClick={() => {
-              onChange(s);
-              setOpen(false);
-            }}
-          >
-            <StatusIcon status={s} size="lg" />
-            {statusLabel(s)}
-          </Button>
-        ))}
-      </PopoverContent>
-    </Popover>
+    <>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>{trigger}</PopoverTrigger>
+        <PopoverContent className="w-40 p-1" align="start">
+          {allStatuses.map((s) => (
+            <Button
+              key={s}
+              variant="ghost"
+              size="sm"
+              className={cn("w-full justify-start gap-2 text-xs", s === status && "bg-accent")}
+              onClick={() => {
+                setOpen(false);
+                // In "In afwachting" parkeren gaat niet zonder escape: de server
+                // weigert `blocked` zonder blokker, interactie of approval. Vraag
+                // dan wie de taak eruit haalt, en stuur de descriptor mee in dezelfde
+                // PATCH. Een issue dat al geparkeerd is, hoeft niet door de stap heen.
+                if (s === PARKED_STATUS && status !== PARKED_STATUS) {
+                  setParking(true);
+                  return;
+                }
+                onChange(s);
+              }}
+            >
+              <StatusIcon status={s} size="lg" />
+              {statusLabel(s)}
+            </Button>
+          ))}
+        </PopoverContent>
+      </Popover>
+      {/* Alleen monteren als hij echt nodig is: een dichte dialoog op elke
+          statusknop kost een query-client en een portal per kaart. */}
+      {parking ? (
+        <ParkIssueDialog
+          open
+          onOpenChange={setParking}
+          issueLabel={issueLabel}
+          onConfirm={(patch) => onChange(patch.status, { unblockDescriptor: patch.unblockDescriptor })}
+        />
+      ) : null}
+    </>
   );
 }

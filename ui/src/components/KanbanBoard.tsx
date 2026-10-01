@@ -19,6 +19,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { StatusIcon } from "./StatusIcon";
+import { ParkIssueDialog } from "./ParkIssueDialog";
 import { PriorityIcon } from "./PriorityIcon";
 import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { Identity } from "./Identity";
@@ -397,6 +398,10 @@ export function KanbanBoard({
   onUpdateIssue,
 }: KanbanBoardProps) {
   const [activeId, setActiveId] = useState<string | null>(null);
+  // Slepen naar "In afwachting" is de enige statuswijziging op het board, en die
+  // zonder escape door de server wordt geweigerd. Vraag dan wie de taak eruit
+  // haalt, in plaats van de kaart stil te laten terugspringen.
+  const [parkIssueId, setParkIssueId] = useState<string | null>(null);
   const paginationKey = `${initialVisibleCount}:${revealIncrement}`;
   const [visibleState, setVisibleState] = useState<{
     paginationKey: string;
@@ -427,6 +432,11 @@ export function KanbanBoard({
     [activeId, issues]
   );
 
+  const parkIssue = useMemo(
+    () => (parkIssueId ? issues.find((i) => i.id === parkIssueId) ?? null : null),
+    [parkIssueId, issues]
+  );
+
   const subtreeLiveCounts = useMemo(
     () => collectSubtreeLiveCounts(issues, liveIssueIds ?? new Set<string>()),
     [issues, liveIssueIds],
@@ -450,6 +460,10 @@ export function KanbanBoard({
     const targetStatus = resolveKanbanTargetStatus(over.id as string, issues);
 
     if (targetStatus && targetStatus !== issue.status) {
+      if (targetStatus === "blocked") {
+        setParkIssueId(issueId);
+        return;
+      }
       onUpdateIssue(issueId, { status: targetStatus });
     }
   }
@@ -501,6 +515,22 @@ export function KanbanBoard({
           <KanbanCard issue={activeIssue} agents={agents} isOverlay compact={compactCards} />
         ) : null}
       </DragOverlay>
+      {/* Alleen monteren tijdens een slepende parkeerstap; een dichte dialoog
+          op het bord zou elke kaart een query-client en portal kosten. */}
+      {parkIssueId ? (
+        <ParkIssueDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setParkIssueId(null);
+          }}
+          issueLabel={parkIssue?.identifier}
+          onConfirm={(patch) => {
+            if (!parkIssueId) return;
+            onUpdateIssue(parkIssueId, patch);
+            setParkIssueId(null);
+          }}
+        />
+      ) : null}
     </DndContext>
   );
 }

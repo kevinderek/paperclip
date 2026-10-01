@@ -2338,7 +2338,8 @@ export function IssueProperties({
             externalConversationState={issue.externalConversationState}
             glyphContainerClassName="inline-flex size-6 shrink-0 items-center justify-center"
             blockerAttention={issue.blockerAttention}
-            onChange={(status) => onUpdate({ status })}
+            onChange={(status, extras) => onUpdate({ status, ...extras })}
+            issueLabel={issue.identifier}
             showLabel
           />
         </PropertyRow>

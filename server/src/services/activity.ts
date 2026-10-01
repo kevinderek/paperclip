@@ -1,5 +1,5 @@
 import { executionProjectionsForRuns } from "./execution-projection.js";
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -20,6 +20,7 @@ import { hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, ISSUE_CONTINUATIO
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { classifyRunLiveness } from "./run-liveness.js";
+import { detoastedJsonbKeys } from "./jsonb-detoast.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -40,45 +41,90 @@ export function normalizeActivityLimit(limit: number | undefined) {
 export function activityService(db: Db) {
   const scheduledLivenessBackfills = new Set<string>();
   const issueIdAsText = sql<string>`${issues.id}::text`;
+  // Eén detoast per brede kolom, in plaats van één per `->`. Zie jsonb-detoast.ts.
+  const runUsageKeys = detoastedJsonbKeys(
+    heartbeatRuns.usageJson,
+    [
+      "inputTokens",
+      "input_tokens",
+      "outputTokens",
+      "output_tokens",
+      "cachedInputTokens",
+      "cached_input_tokens",
+      "cache_read_input_tokens",
+      "billingType",
+      "billing_type",
+      "costUsd",
+      "cost_usd",
+      "total_cost_usd",
+    ],
+    "run_usage",
+  );
+  const runResultKeys = detoastedJsonbKeys(
+    heartbeatRuns.resultJson,
+    [
+      "conversationReset",
+      "workspaceRestoreFailure",
+      "workspaceRestorePath",
+      "finalResponseRecorded",
+      "billingType",
+      "billing_type",
+      "costUsd",
+      "cost_usd",
+      "total_cost_usd",
+      "stopReason",
+      "effectiveTimeoutSec",
+      "effectiveTimeoutMs",
+      "timeoutConfigured",
+      "timeoutSource",
+      "timeoutFired",
+    ],
+    "run_result",
+  );
+  const runContextKeys = detoastedJsonbKeys(
+    heartbeatRuns.contextSnapshot,
+    ["wakeCommentIds", "wakeCommentId", "commentId", "issueId"],
+    "run_context",
+  );
   const summarizedUsageJson = sql<Record<string, unknown> | null>`
     case
       when ${heartbeatRuns.usageJson} is null then null
       else jsonb_strip_nulls(jsonb_build_object(
-        'inputTokens', coalesce(${heartbeatRuns.usageJson} -> 'inputTokens', ${heartbeatRuns.usageJson} -> 'input_tokens'),
-        'input_tokens', coalesce(${heartbeatRuns.usageJson} -> 'input_tokens', ${heartbeatRuns.usageJson} -> 'inputTokens'),
-        'outputTokens', coalesce(${heartbeatRuns.usageJson} -> 'outputTokens', ${heartbeatRuns.usageJson} -> 'output_tokens'),
-        'output_tokens', coalesce(${heartbeatRuns.usageJson} -> 'output_tokens', ${heartbeatRuns.usageJson} -> 'outputTokens'),
+        'inputTokens', coalesce(${runUsageKeys.jsonb("inputTokens")}, ${runUsageKeys.jsonb("input_tokens")}),
+        'input_tokens', coalesce(${runUsageKeys.jsonb("input_tokens")}, ${runUsageKeys.jsonb("inputTokens")}),
+        'outputTokens', coalesce(${runUsageKeys.jsonb("outputTokens")}, ${runUsageKeys.jsonb("output_tokens")}),
+        'output_tokens', coalesce(${runUsageKeys.jsonb("output_tokens")}, ${runUsageKeys.jsonb("outputTokens")}),
         'cachedInputTokens', coalesce(
-          ${heartbeatRuns.usageJson} -> 'cachedInputTokens',
-          ${heartbeatRuns.usageJson} -> 'cached_input_tokens',
-          ${heartbeatRuns.usageJson} -> 'cache_read_input_tokens'
+          ${runUsageKeys.jsonb("cachedInputTokens")},
+          ${runUsageKeys.jsonb("cached_input_tokens")},
+          ${runUsageKeys.jsonb("cache_read_input_tokens")}
         ),
         'cached_input_tokens', coalesce(
-          ${heartbeatRuns.usageJson} -> 'cached_input_tokens',
-          ${heartbeatRuns.usageJson} -> 'cachedInputTokens',
-          ${heartbeatRuns.usageJson} -> 'cache_read_input_tokens'
+          ${runUsageKeys.jsonb("cached_input_tokens")},
+          ${runUsageKeys.jsonb("cachedInputTokens")},
+          ${runUsageKeys.jsonb("cache_read_input_tokens")}
         ),
         'cache_read_input_tokens', coalesce(
-          ${heartbeatRuns.usageJson} -> 'cache_read_input_tokens',
-          ${heartbeatRuns.usageJson} -> 'cached_input_tokens',
-          ${heartbeatRuns.usageJson} -> 'cachedInputTokens'
+          ${runUsageKeys.jsonb("cache_read_input_tokens")},
+          ${runUsageKeys.jsonb("cached_input_tokens")},
+          ${runUsageKeys.jsonb("cachedInputTokens")}
         ),
-        'billingType', coalesce(${heartbeatRuns.usageJson} -> 'billingType', ${heartbeatRuns.usageJson} -> 'billing_type'),
-        'billing_type', coalesce(${heartbeatRuns.usageJson} -> 'billing_type', ${heartbeatRuns.usageJson} -> 'billingType'),
+        'billingType', coalesce(${runUsageKeys.jsonb("billingType")}, ${runUsageKeys.jsonb("billing_type")}),
+        'billing_type', coalesce(${runUsageKeys.jsonb("billing_type")}, ${runUsageKeys.jsonb("billingType")}),
         'costUsd', coalesce(
-          ${heartbeatRuns.usageJson} -> 'costUsd',
-          ${heartbeatRuns.usageJson} -> 'cost_usd',
-          ${heartbeatRuns.usageJson} -> 'total_cost_usd'
+          ${runUsageKeys.jsonb("costUsd")},
+          ${runUsageKeys.jsonb("cost_usd")},
+          ${runUsageKeys.jsonb("total_cost_usd")}
         ),
         'cost_usd', coalesce(
-          ${heartbeatRuns.usageJson} -> 'cost_usd',
-          ${heartbeatRuns.usageJson} -> 'costUsd',
-          ${heartbeatRuns.usageJson} -> 'total_cost_usd'
+          ${runUsageKeys.jsonb("cost_usd")},
+          ${runUsageKeys.jsonb("costUsd")},
+          ${runUsageKeys.jsonb("total_cost_usd")}
         ),
         'total_cost_usd', coalesce(
-          ${heartbeatRuns.usageJson} -> 'total_cost_usd',
-          ${heartbeatRuns.usageJson} -> 'cost_usd',
-          ${heartbeatRuns.usageJson} -> 'costUsd'
+          ${runUsageKeys.jsonb("total_cost_usd")},
+          ${runUsageKeys.jsonb("cost_usd")},
+          ${runUsageKeys.jsonb("costUsd")}
         )
       ))
     end
@@ -87,37 +133,37 @@ export function activityService(db: Db) {
     case
       when ${heartbeatRuns.resultJson} is null then null
       else jsonb_strip_nulls(jsonb_build_object(
-        'conversationReset', ${heartbeatRuns.resultJson} -> 'conversationReset',
-        'workspaceRestoreFailure', case when ${heartbeatRuns.resultJson} ->> 'workspaceRestoreFailure'
+        'conversationReset', ${runResultKeys.jsonb("conversationReset")},
+        'workspaceRestoreFailure', case when ${runResultKeys.text("workspaceRestoreFailure")}
           in ('restore_permission_denied', 'restore_lock_timeout', 'restore_unsafe_archive', 'restore_failed')
-          then ${heartbeatRuns.resultJson} -> 'workspaceRestoreFailure' end,
-        'workspaceRestorePath', case when length(${heartbeatRuns.resultJson} ->> 'workspaceRestorePath') <= 180
-          then ${heartbeatRuns.resultJson} -> 'workspaceRestorePath' end,
-        'finalResponseRecorded', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'finalResponseRecorded') = 'boolean'
-          then ${heartbeatRuns.resultJson} -> 'finalResponseRecorded' end,
-        'billingType', coalesce(${heartbeatRuns.resultJson} -> 'billingType', ${heartbeatRuns.resultJson} -> 'billing_type'),
-        'billing_type', coalesce(${heartbeatRuns.resultJson} -> 'billing_type', ${heartbeatRuns.resultJson} -> 'billingType'),
+          then ${runResultKeys.jsonb("workspaceRestoreFailure")} end,
+        'workspaceRestorePath', case when length(${runResultKeys.text("workspaceRestorePath")}) <= 180
+          then ${runResultKeys.jsonb("workspaceRestorePath")} end,
+        'finalResponseRecorded', case when jsonb_typeof(${runResultKeys.jsonb("finalResponseRecorded")}) = 'boolean'
+          then ${runResultKeys.jsonb("finalResponseRecorded")} end,
+        'billingType', coalesce(${runResultKeys.jsonb("billingType")}, ${runResultKeys.jsonb("billing_type")}),
+        'billing_type', coalesce(${runResultKeys.jsonb("billing_type")}, ${runResultKeys.jsonb("billingType")}),
         'costUsd', coalesce(
-          ${heartbeatRuns.resultJson} -> 'costUsd',
-          ${heartbeatRuns.resultJson} -> 'cost_usd',
-          ${heartbeatRuns.resultJson} -> 'total_cost_usd'
+          ${runResultKeys.jsonb("costUsd")},
+          ${runResultKeys.jsonb("cost_usd")},
+          ${runResultKeys.jsonb("total_cost_usd")}
         ),
         'cost_usd', coalesce(
-          ${heartbeatRuns.resultJson} -> 'cost_usd',
-          ${heartbeatRuns.resultJson} -> 'costUsd',
-          ${heartbeatRuns.resultJson} -> 'total_cost_usd'
+          ${runResultKeys.jsonb("cost_usd")},
+          ${runResultKeys.jsonb("costUsd")},
+          ${runResultKeys.jsonb("total_cost_usd")}
         ),
         'total_cost_usd', coalesce(
-          ${heartbeatRuns.resultJson} -> 'total_cost_usd',
-          ${heartbeatRuns.resultJson} -> 'cost_usd',
-          ${heartbeatRuns.resultJson} -> 'costUsd'
+          ${runResultKeys.jsonb("total_cost_usd")},
+          ${runResultKeys.jsonb("cost_usd")},
+          ${runResultKeys.jsonb("costUsd")}
         ),
-        'stopReason', ${heartbeatRuns.resultJson} -> 'stopReason',
-        'effectiveTimeoutSec', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutSec',
-        'effectiveTimeoutMs', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutMs',
-        'timeoutConfigured', ${heartbeatRuns.resultJson} -> 'timeoutConfigured',
-        'timeoutSource', ${heartbeatRuns.resultJson} -> 'timeoutSource',
-        'timeoutFired', ${heartbeatRuns.resultJson} -> 'timeoutFired'
+        'stopReason', ${runResultKeys.jsonb("stopReason")},
+        'effectiveTimeoutSec', ${runResultKeys.jsonb("effectiveTimeoutSec")},
+        'effectiveTimeoutMs', ${runResultKeys.jsonb("effectiveTimeoutMs")},
+        'timeoutConfigured', ${runResultKeys.jsonb("timeoutConfigured")},
+        'timeoutSource', ${runResultKeys.jsonb("timeoutSource")},
+        'timeoutFired', ${runResultKeys.jsonb("timeoutFired")}
       ))
     end
   `.as("resultJson");
@@ -415,10 +461,10 @@ export function activityService(db: Db) {
           continuationAttempt: heartbeatRuns.continuationAttempt,
           lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
           nextAction: heartbeatRuns.nextAction,
-          wakeCommentIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds'`,
-          wakeCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
-          contextCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
-          contextIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+          wakeCommentIds: runContextKeys.jsonb("wakeCommentIds") as SQL<string[] | null>,
+          wakeCommentId: runContextKeys.text("wakeCommentId") as SQL<string | null>,
+          contextCommentId: runContextKeys.text("commentId") as SQL<string | null>,
+          contextIssueId: runContextKeys.text("issueId") as SQL<string | null>,
         })
         .from(heartbeatRuns)
         .innerJoin(
@@ -428,18 +474,29 @@ export function activityService(db: Db) {
             eq(agents.companyId, heartbeatRuns.companyId),
           ),
         )
+        .leftJoin(runContextKeys.join, sql`true`)
+        .leftJoin(runUsageKeys.join, sql`true`)
+        .leftJoin(runResultKeys.join, sql`true`)
         .where(
           and(
             eq(heartbeatRuns.companyId, companyId),
-            or(
-              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-              sql`exists (
-                select 1
-                from ${activityLog}
+            // `id in (A ∪ B)` in plaats van `A or exists(B)`. De `or`-vorm kan
+            // `heartbeat_runs_company_ctx_issue_created_idx` niet gebruiken en
+            // eindigt in een Seq Scan over alle runs van het bedrijf, waarbij
+            // `context_snapshot ->> 'issueId'` elke TOASTed rij volledig
+            // detoast. Gemeten: 1,2 s vaste kost op een issue met 3 runs.
+            inArray(
+              heartbeatRuns.id,
+              sql`(
+                select ${heartbeatRuns.id} from ${heartbeatRuns}
+                where ${heartbeatRuns.companyId} = ${companyId}
+                  and ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
+                union
+                select ${activityLog.runId} from ${activityLog}
                 where ${activityLog.companyId} = ${companyId}
                   and ${activityLog.entityType} = 'issue'
                   and ${activityLog.entityId} = ${issueId}
-                  and ${activityLog.runId} = ${heartbeatRuns.id}
+                  and ${activityLog.runId} is not null
               )`,
             ),
           ),

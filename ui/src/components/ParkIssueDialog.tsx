@@ -93,9 +93,10 @@ export function ParkIssueDialog({
           <DialogTitle>Move to In afwachting</DialogTitle>
           <DialogDescription>
             {issueLabel ? `${issueLabel} stops here. ` : ""}
-            No agent picks it up while it waits, and a scheduled check on it
-            lapses. Say who takes it out of waiting and what has to happen
-            first.
+            It keeps its place and a scheduled check still runs: the task stays
+            put until that check comes due, and then the agent it is assigned to
+            picks it up again. Say who takes it out of waiting and what has to
+            happen first.
           </DialogDescription>
         </DialogHeader>
 

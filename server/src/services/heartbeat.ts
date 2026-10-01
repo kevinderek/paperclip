@@ -426,6 +426,8 @@ import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
+  ISSUE_MONITOR_DISPATCH_STATUSES,
+  issueMonitorCanDispatch,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
@@ -11844,9 +11846,9 @@ export function heartbeatService(
     if (!issue.assigneeAgentId || issue.assigneeUserId) {
       throw conflict("Issue monitor requires an agent assignee");
     }
-    if (!["in_progress", "in_review"].includes(issue.status)) {
+    if (!issueMonitorCanDispatch(issue.status)) {
       throw conflict(
-        "Issue monitor can only run while the issue is in progress or in review",
+        `Issue monitor can only run while the issue is ${ISSUE_MONITOR_DISPATCH_STATUSES.join(", ")}`,
       );
     }
 
@@ -11864,7 +11866,7 @@ export function heartbeatService(
             sql`${issues.monitorNextCheckAt} is not null`,
             isNull(issues.assigneeUserId),
             sql`${issues.assigneeAgentId} is not null`,
-            inArray(issues.status, ["in_progress", "in_review"]),
+            inArray(issues.status, ISSUE_MONITOR_DISPATCH_STATUSES),
             or(
               isNull(issues.monitorWakeRequestedAt),
               lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -11906,7 +11908,7 @@ export function heartbeatService(
           lte(issues.monitorNextCheckAt, now),
           isNull(issues.assigneeUserId),
           sql`${issues.assigneeAgentId} is not null`,
-          inArray(issues.status, ["in_progress", "in_review"]),
+          inArray(issues.status, ISSUE_MONITOR_DISPATCH_STATUSES),
           or(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -11934,7 +11936,7 @@ export function heartbeatService(
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
               sql`${issues.assigneeAgentId} is not null`,
-              inArray(issues.status, ["in_progress", "in_review"]),
+              inArray(issues.status, ISSUE_MONITOR_DISPATCH_STATUSES),
               or(
                 isNull(issues.monitorWakeRequestedAt),
                 lt(issues.monitorWakeRequestedAt, staleClaimThreshold),

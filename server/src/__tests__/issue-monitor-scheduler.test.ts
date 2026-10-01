@@ -22,10 +22,12 @@ import {
   workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -45,7 +47,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-monitor-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+    // This suite seeds a full company graph and drives real heartbeat runs, so
+    // its embedded-Postgres boot costs more than the config-wide 30s hook
+    // budget once migrations are included. Measured 2026-10-01 on a loaded
+    // sandbox: 52s boot, 113s for the file. The old explicit 20s override made
+    // the whole file skip before a single assertion ran.
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   async function waitForHeartbeatIdle(timeoutMs = 3_000) {
     const deadline = Date.now() + timeoutMs;
@@ -149,7 +156,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
-    issueStatus?: "in_progress" | "in_review";
+    issueStatus?: "in_progress" | "in_review" | "blocked";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
   }) {
@@ -281,6 +288,184 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_triggered");
   });
+
+  /**
+   * REK-450, variant A: parkeren behoudt de klok *én* de check gaat af. Dit is
+   * de helft van het paar op de dispatch-poort (de retention-poort staat in
+   * `issue-execution-policy.test.ts`); de scan en de claim in deze lus zijn poort
+   * 4 en poort 5 uit de opdracht.
+   *
+   * De test is een paar in één vak: hij meet (a) dat de scan een geparkeerde taak
+   * met een levende monitor oppakt, en (b) dat de claim in de lus de monitor daadwerkelijk
+   * vuurt. Wie alleen de scan repareert en de claim laat staan, ziet (b) rood:
+   * `enqueued` is dan 0 en er komt geen wake. Wie alleen de claim repareert en de
+   * scan laat staan, ziet (a) rood. En de derde helft meet dat er geen wakerlus is.
+   */
+  it("fires a parked task's monitor at the appointed moment, wakes its assignee once, and does not loop", async () => {
+    const { issueId, agentId, nextCheckAt } = await seedFixture({ issueStatus: "blocked" });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const fired = await heartbeat.tickTimers(tickAt);
+    expect(fired.enqueued).toBe(1);
+    expect(fired.skipped).toBe(0);
+
+    // The wake happened while the task was still parked. That is the whole
+    // point of variant A: "In afwachting" is a parking status, not a status
+    // nobody may wake.
+    const woken = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(woken.status).toBe("blocked");
+    expect(woken.monitorAttemptCount).toBe(1);
+    expect(parseIssueExecutionState(woken.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      attemptCount: 1,
+    });
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("issue_monitor_due");
+    expect(wakeup?.payload).toMatchObject({ issueId });
+
+    // Criterium 8, geen wakerlus: the monitor is one-shot, so a parked task whose
+    // agent does nothing after the wake may not re-wake on the next cycle. One
+    // `monitorNextCheckAt` buys exactly one wake. The stale-claim threshold is
+    // 5 minutes, so a later cycle past that window is the honest place to look:
+    // if the monitor had survived instead of firing one-shot, this is where a
+    // per-cycle repetition would show up.
+    const laterTick = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(laterTick.enqueued).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
+
+    const afterStaleWindow = await heartbeat.tickTimers(new Date("2026-04-11T12:40:00.000Z"));
+    expect(afterStaleWindow.enqueued).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
+
+    const settled = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(settled.monitorNextCheckAt).toBeNull();
+    expect(settled.monitorAttemptCount).toBe(1);
+    expect(nextCheckAt.toISOString()).toBe("2026-04-11T12:30:00.000Z");
+  });
+
+  it("runs an on-demand check on a parked task and wakes its assignee", async () => {
+    const { issueId, agentId } = await seedFixture({ issueStatus: "blocked" });
+
+    const result = await heartbeatService(db).triggerIssueMonitor(issueId, {
+      now: new Date("2026-04-11T12:31:00.000Z"),
+      actorType: "user",
+      actorId: "local-board",
+    });
+
+    // Poort 2 (the guard) and poort 3 (the claim) are one `it`: the guard lets a
+    // parked task through, and the claim filter has to let it through too, or the
+    // 409 "already in progress" lies about why the button failed.
+    expect(result).toMatchObject({ outcome: "triggered" });
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("issue_monitor_due");
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.status).toBe("blocked");
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(issue.monitorAttemptCount).toBe(1);
+  });
+
+  it("still refuses an on-demand check on a closed task", async () => {
+    const { issueId } = await seedFixture({ issueStatus: "in_progress" });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+
+    await expect(
+      heartbeatService(db).triggerIssueMonitor(issueId, {
+        now: new Date("2026-04-11T12:31:00.000Z"),
+        actorType: "user",
+        actorId: "local-board",
+      }),
+    ).rejects.toThrow(/can only run while the issue is/);
+  });
+
+  /**
+   * REK-450, acceptatiecriterium 1 en 7: het volledige pad, zonder codeduiding.
+   *
+   * De andere tests in dit bestand bewijzen poort voor poort wat er gebeurt. Deze
+   * test doet wat een gebruiker doet: hij parkeert een taak die een levende monitor
+   * heeft, leest daarna de opgeslagen rij vers uit de database (niet de samengevatte
+   * weergave van de eigen PATCH), en laat de scheduler daarna zijn werk doen.
+   *
+   * De eerste helft is poort 1 en de tweede helft is poort 4 plus 5. Ze staan in één
+   * `it` omdat de opdracht beide eist en omdat een groene test op de helften apart
+   * niets zegt over het paar: een fix die de klok bewaart maar niet afschiet, of
+   * omgekeerd, levert in elk van beide een groene suite op.
+   */
+  it("keeps the clock through a real park, then wakes the assignee with the task still parked", async () => {
+    const { companyId, issueId, agentId, nextCheckAt } = await seedFixture({ issueStatus: "in_progress" });
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await issueService(db).update(issueId, {
+      status: "blocked",
+      actorUserId: "local-board",
+      unblockDescriptor: {
+        owner: { agentId },
+        action: "Check the deployment window",
+      },
+    });
+
+    // Criterium 1: een verse lezing van de opgeslagen rij. De respons van de
+    // PATCH zou een samengevatte weergave zijn en bewijst hier niets.
+    const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parked.status).toBe("blocked");
+    expect(parked.monitorNextCheckAt).toEqual(nextCheckAt);
+    expect(parked.monitorAttemptCount).toBe(0);
+    expect(normalizeIssueExecutionPolicy(parked.executionPolicy ?? null)?.monitor).toMatchObject({
+      nextCheckAt: nextCheckAt.toISOString(),
+    });
+    expect(parseIssueExecutionState(parked.executionState)?.monitor).toMatchObject({
+      status: "scheduled",
+      nextCheckAt: nextCheckAt.toISOString(),
+      clearedAt: null,
+      clearReason: null,
+    });
+
+    // Criterium 7: de wake echt laten plaatsvinden, en de status nog steeds `blocked`.
+    const fired = await heartbeatService(db).tickTimers(tickAt);
+    expect(fired.enqueued).toBe(1);
+
+    const afterWake = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(afterWake.status).toBe("blocked");
+    expect(afterWake.monitorNextCheckAt).toBeNull();
+    expect(await afterWaitForWake(agentId)).toMatchObject({ reason: "issue_monitor_due" });
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_triggered");
+
+    // Criterium 8, op dit pad: één `monitorNextCheckAt` levert één wake. De staleness
+    // van de claim is 5 minuten, dus een cyclus daarachter is de eerlijke plek om een
+    // wakerlus te zien. De monitor is one-shot en die tick levert niets op.
+    const next = await heartbeatService(db).tickTimers(new Date("2026-04-11T12:40:00.000Z"));
+    expect(next.enqueued).toBe(0);
+    expect(
+      await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)),
+    ).toHaveLength(1);
+
+    expect(companyId).toBeTruthy();
+  });
+
+  function afterWaitForWake(agentId: string) {
+    return db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+  }
 
   it.each(["unknown", "exhausted"] as const)("does not replay a quota monitor with %s execution evidence", async (kind) => {
     const sourceRunId = randomUUID();

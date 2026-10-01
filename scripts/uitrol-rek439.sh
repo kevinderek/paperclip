@@ -35,7 +35,11 @@ BRON="${BRON:-${MAP}/paperclip-rek439}"
 COMMIT="${COMMIT:-$(git -C "$BRON" rev-parse HEAD 2>/dev/null || true)}"
 COMMIT="${COMMIT:-f6ece823ab1bba35c016c9fdb869ab6c5ba0ed90}"
 IMAGE_TAG="paperclip-rek439:${COMMIT:0:12}"
-ANKER="${MAP}/terugval-anker-rek439.txt"
+# Het anker hoort naast de clone, niet erin: anders komt de working tree van de
+# host vol te staan met een bestand dat er niet in hoort, en een volgende
+# `git pull` ziet onverwachte wijzigingen.
+REPO_ROOT="$(git -C "$MAP" rev-parse --show-toplevel 2>/dev/null || echo "$MAP")"
+ANKER="${ANKER:-$(dirname "$REPO_ROOT")/terugval-anker-rek439.txt}"
 
 rood()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 groen() { printf '\033[32m%s\033[0m\n' "$*" >&2; }

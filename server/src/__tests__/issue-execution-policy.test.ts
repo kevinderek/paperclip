@@ -1733,6 +1733,175 @@ describe("issue execution policy transitions", () => {
       });
     });
 
+    /**
+     * REK-450, variant A: parkeren ("In afwachting") is tijdelijk, dus een levende
+     * monitor overleeft de overgang naar `blocked` én een nieuwe check mag op een
+     * geparkeerde taak gezet worden. Deze test is de helft van het paar op de
+     * retention-poort; de dispatch-poort in `heartbeat.ts` (poorten 2 t/m 5) staat in
+     * `issue-monitor-scheduler.test.ts`. Eén lijst `ISSUE_MONITOR_LIVE_STATUSES` draagt
+     * alle drie de rollen, dus wie er één repareert ziet de andere twee in deze suite
+     * of in die andere rood worden — dat is het paar dat de opdracht vraagt.
+     */
+    it("keeps a live monitor clock when the task is parked, and accepts a new one there", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Check deployment",
+          scheduledBy: "assignee",
+        },
+      })!;
+      const scheduledState = {
+        status: "idle" as const,
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "scheduled" as const,
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          lastTriggeredAt: null,
+          attemptCount: 0,
+          notes: "Check deployment",
+          scheduledBy: "assignee",
+          clearedAt: null,
+          clearReason: null,
+        },
+      };
+
+      const parked = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: scheduledState,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+          monitorAttemptCount: 0,
+          monitorNotes: "Check deployment",
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        previousPolicy: policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+      });
+
+      // No `executionPolicy` key: the patch leaves the stored policy untouched
+      // instead of rewriting it, which is what "the monitor is kept" means.
+      expect(parked.patch.executionPolicy).toBeUndefined();
+      expect(parked.patch.monitorNextCheckAt).toEqual(new Date("2026-04-11T12:30:00.000Z"));
+      expect(parked.patch.monitorWakeRequestedAt).toBeNull();
+      // The monitor state is byte-identical to what it was, so the transition
+      // emits no cleared monitor state at all. Before REK-450 this patch carried
+      // `executionPolicy: null`, `monitorNextCheckAt: null` and a cleared state
+      // with `clearReason: "invalid_status"`.
+      expect(parked.patch.executionState).toBeUndefined();
+      expect(
+        parseIssueExecutionState(scheduledState)?.monitor,
+      ).toMatchObject({
+        status: "scheduled",
+        nextCheckAt: "2026-04-11T12:30:00.000Z",
+        clearedAt: null,
+        clearReason: null,
+      });
+
+      // Retention and arming read the same list, so a follow-up check can also be
+      // set while the task is parked. Under variant A the heartbeat dispatches from
+      // there, so refusing this write would strand the clock the park just kept:
+      // the agent could not re-arm after it runs. A new clock is written, and a
+      // different `nextCheckAt` is what proves this is a real re-arm and not the
+      // retained value echoed back.
+      const nextPolicy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-12T09:00:00.000Z",
+          notes: "Re-check the deployment",
+          scheduledBy: "assignee",
+        },
+      })!;
+      const rearmed = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "blocked",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: scheduledState,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+        },
+        policy: nextPolicy,
+        previousPolicy: policy,
+        requestedStatus: undefined,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+      expect(rearmed.patch.monitorNextCheckAt).toEqual(new Date("2026-04-12T09:00:00.000Z"));
+      expect(rearmed.patch.monitorNotes).toBe("Re-check the deployment");
+      expect(parseIssueExecutionState(rearmed.patch.executionState)?.monitor).toMatchObject({
+        status: "scheduled",
+        nextCheckAt: "2026-04-12T09:00:00.000Z",
+        attemptCount: 0,
+      });
+
+      // A parked task without a monitor does not grow one.
+      const withoutMonitor = normalizeIssueExecutionPolicy({ stages: [] })!;
+      const parkedWithoutMonitor = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: withoutMonitor,
+          executionState: null,
+          monitorNextCheckAt: null,
+        },
+        policy: withoutMonitor,
+        previousPolicy: withoutMonitor,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+      });
+      expect(parkedWithoutMonitor.patch).toEqual({});
+    });
+
+    it("auto-clears a scheduled monitor when the issue moves to cancelled", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Check deployment",
+          scheduledBy: "assignee",
+        },
+      })!;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "blocked",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+          monitorAttemptCount: 0,
+        },
+        policy,
+        previousPolicy: policy,
+        requestedStatus: "cancelled",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "cancelled" },
+      });
+    });
+
     it("rejects explicitly scheduling a monitor on an invalid issue state", () => {
       const policy = normalizeIssueExecutionPolicy({
         stages: [],
@@ -1745,7 +1914,7 @@ describe("issue execution policy transitions", () => {
       expect(() =>
         applyIssueExecutionPolicyTransition({
           issue: {
-            status: "blocked",
+            status: "backlog",
             assigneeAgentId: coderAgentId,
             assigneeUserId: null,
             executionPolicy: null,

@@ -71,7 +71,7 @@ export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
-const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
+const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent that are in progress, in review, or in waiting";
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
 const STAGE_DECISION_COMMENT_HINT = "Include the decision comment in the same PATCH request; prior comments are not considered.";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
@@ -262,8 +262,44 @@ function buildClearedMonitorState(input: {
   };
 }
 
+/**
+ * The one list that decides the fate of a monitor on a status: arming,
+ * retention across a status transition, and dispatch by the heartbeat all read
+ * it. `blocked` ("In afwachting") is in it because parking is temporary — the
+ * board decision of 2026-10-01 (REK-450, variant A) is that a parked task keeps
+ * its clock *and* that the check still fires at the appointed moment. A task
+ * waiting for the board is not a task nobody may wake.
+ *
+ * One list, not three. Three separate lists is exactly the drift this task was
+ * opened for: retention was widened on one branch while dispatch stayed shut,
+ * which tests green and does nothing in production. If a future product
+ * decision narrows one of the three roles again, add a second list *and* the
+ * test that proves the other two roles are unaffected in the same run.
+ */
+export const ISSUE_MONITOR_LIVE_STATUSES = ["in_progress", "in_review", "blocked"] as const;
+
+/**
+ * Statuses on which the heartbeat may fire an existing monitor. Derived from the
+ * one list above, and exported because `heartbeat.ts` filters on it in three
+ * places: the on-demand `monitor/check-now` guard and claim, plus the scan and
+ * the claim inside `tickDueIssueMonitors`.
+ */
+export const ISSUE_MONITOR_DISPATCH_STATUSES = ISSUE_MONITOR_LIVE_STATUSES;
+
+const ISSUE_MONITOR_LIVE_STATUS_SET: ReadonlySet<string> = new Set(ISSUE_MONITOR_LIVE_STATUSES);
+
+export function issueMonitorCanDispatch(status: string) {
+  return ISSUE_MONITOR_LIVE_STATUS_SET.has(status);
+}
+
+/** A fresh `executionPolicy.monitor` is only accepted on a status in the list. */
 function issueAllowsMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
-  return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review");
+  return Boolean(assigneeAgentId) && !assigneeUserId && ISSUE_MONITOR_LIVE_STATUS_SET.has(status);
+}
+
+/** An already-armed monitor survives a transition onto a status in the list. */
+function issueRetainsMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
+  return Boolean(assigneeAgentId) && !assigneeUserId && ISSUE_MONITOR_LIVE_STATUS_SET.has(status);
 }
 
 function monitorClearReasonForIssue(
@@ -273,7 +309,7 @@ function monitorClearReasonForIssue(
 ): IssueExecutionMonitorClearReason | null {
   if (status === "done") return "done";
   if (status === "cancelled") return "cancelled";
-  if (!issueAllowsMonitor(status, assigneeAgentId, assigneeUserId)) {
+  if (!issueRetainsMonitor(status, assigneeAgentId, assigneeUserId)) {
     if (assigneeUserId || !assigneeAgentId) return "invalid_assignee";
     return "invalid_status";
   }
@@ -1070,13 +1106,22 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
     ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId)
     : null;
 
+  // An explicit monitor write is only accepted on a status that carries a live
+  // clock and has an agent to wake. Without this, `invalidReason` alone would
+  // silently strip a monitor that the caller asked for on, say, a user-assigned
+  // issue instead of telling them it does not belong there.
+  if (
+    input.policy?.monitor &&
+    input.monitorExplicitlyUpdated &&
+    !issueAllowsMonitor(nextStatus, assigneeAgentId, assigneeUserId)
+  ) {
+    throw unprocessable(MONITOR_INVALID_MESSAGE);
+  }
+
   let targetMonitorState = currentMonitorState;
 
   if (input.policy?.monitor) {
     if (invalidReason) {
-      if (input.monitorExplicitlyUpdated) {
-        throw unprocessable(MONITOR_INVALID_MESSAGE);
-      }
       patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
       patch.monitorNextCheckAt = null;
       patch.monitorWakeRequestedAt = null;

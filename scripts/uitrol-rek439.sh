@@ -378,7 +378,8 @@ config() {
 # en de container-herstart blijft achter de handmatige bevestiging UITROL.
 alles() {
   kop "A. Volledige rit: inspect -> bouw -> koppel -> start -> rapport"
-  inspect
+  kop "A1. Inspecteren (wat draait er, en klopt de bron)"
+  controleer
   bouw
   koppel
   start

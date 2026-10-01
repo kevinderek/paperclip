@@ -66,6 +66,14 @@ vind_compose() {
 controleer() {
   kop "1. Wat draait er nu?"
   command -v docker >/dev/null 2>&1 || { rood "docker ontbreekt op deze host. Stop hier."; exit 1; }
+  # `command -v docker` zegt niets over rechten. Zonder deze stap loopt de rit
+  # pas bij `docker build` vast op een onduidelijke permission-melding, minuten
+  # later en halverwege; hier is het antwoord meteen te geven.
+  if ! docker info >/dev/null 2>&1; then
+    rood "Deze gebruiker mag docker niet gebruiken: 'docker info' faalt."
+    rood "Twee uitwegen: draai de rit als root, of voeg de gebruiker toe aan de docker-groep."
+    exit 1
+  fi
   COMPOSE="$(vind_compose)" || true
   if [ -z "${COMPOSE:-}" ]; then
     rood "Geen docker-compose.yml gevonden. Zet COMPOSE=<pad> in de omgeving en draai opnieuw."

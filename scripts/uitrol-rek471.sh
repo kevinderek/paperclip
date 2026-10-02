@@ -257,6 +257,12 @@ schrijf_anker() {
     echo "HUIDIGE_IMAGE=${HUIDIGE_IMAGE:-}"
     echo "HUIDIGE_LABEL=$HUIDIGE_LABEL"
     echo "HUIDIGE_ID=$HUIDIGE_ID"
+    # De rechten van de compose, want dát is de oorzaak van twee storingen in één
+    # uitrol: `mv` vroeg om bevestiging en `docker inspect` gaf geen label terug.
+    # Zonder deze regel moet iemand dat later zelf uitzoeken.
+    echo "COMPOSE_EIGENAAR=$(stat -c '%U' "$COMPOSE" 2>/dev/null || echo onbekend)"
+    echo "COMPOSE_RECHTEN=$(stat -c '%a' "$COMPOSE" 2>/dev/null || echo onbekend)"
+    echo "SCRIPT_DRAAIT_ALS=$(id -un 2>/dev/null || echo onbekend)"
     echo "# terugval 1 (als er een compose-backup ligt): ./uitrol-rek471.sh terugval"
     if [ -n "${HUIDIGE_LABEL:-}" ] && [ "$HUIDIGE_LABEL" != "onbekend" ]; then
       echo "# terugval 2 (zonder backup): docker compose -f $COMPOSE up -d --force-recreate $HUIDIGE_LABEL"
@@ -370,8 +376,34 @@ koppel() {
   # plek losse `cp ... ; exit 1`-paren, en toen de gate door een eigen fout vroeg
   # stopte (unbound variable) bleef de gewijzigde compose gewoon staan.
   terugdraai() {
-    cp -p "$BACKUP" "$COMPOSE"
-    rood "de terugvalkopie is teruggezet; er is niets gewijzigd."
+    # `mv -f`, niet `cp -p`. Gemeten 2026-10-02 11:03Z: met een compose op mode 0444
+    # — de stand op de host, want de compose is van `root` en dit script draait als
+    # `kevin` — geeft `cp` dit:
+    #
+    #   cp: cannot create regular file 'docker-compose.yml': Permission denied
+    #
+    # Dus de terugdraai-stap werkte niet in precies de omgeving waar de uitrol
+    # vastliep. Een terugvalpad dat `Permission denied` geeft is geen terugvalpad,
+    # en de foutmelding ervan is de laatste die iemand wil lezen als er iets
+    # misgaat.
+    #
+    # `mv` hernoemt binnen dezelfde map en daarvoor is alleen schrijfrecht op de
+    # map nodig, niet op het bestand zelf. Gemeten op dezelfde vorm: exit 0, geen
+    # vraag, en het bestand staat er.
+    #
+    # De backup gaat hiermee weg; daarom maakt de poort eronder een nieuwe
+    # voordat hij stopt. Zonder die kopie zou een tweede terugdraai in dezelfde
+    # run niets te doen hebben.
+    if mv -f "$BACKUP" "$COMPOSE"; then
+      cp -p "$COMPOSE" "${COMPOSE}.terugvalkopie-gebruikt-$(date -u +%Y%m%dT%H%M%SZ)"
+      rood "de terugvalkopie is teruggezet; er is niets gewijzigd."
+    else
+      rood "Terugdraaien lukte niet. Zet de compose zelf terug:"
+      rood "  cp -p $BACKUP $COMPOSE"
+      rood "of, als dat weigert:"
+      rood "  mv -f $BACKUP $COMPOSE"
+      exit 1
+    fi
     exit 1
   }
 
@@ -528,7 +560,16 @@ terugval() {
     exit 1
   fi
   kop "Terugdraaien naar $BACKUP"
-  cp -p "$BACKUP" "$COMPOSE"
+  # Zelfde reden als in `terugdraai()`: `cp` kan een root-bezette compose niet
+  # overschrijven vanuit een `kevin`-shell, `mv` wel.
+  if ! mv -f "$BACKUP" "$COMPOSE"; then
+    rood "Terugdraaien lukte niet met mv. Doe dit met de hand:"
+    rood "  cp -p $BACKUP $COMPOSE   # of, als dat weigert:"
+    rood "  sudo mv -f $BACKUP $COMPOSE"
+    exit 1
+  fi
+  [ -s "$COMPOSE" ] \
+    || { rood "de teruggezette compose is leeg. Kijk of $BACKUP nog bestaat."; exit 1; }
   docker compose -f "$COMPOSE" up -d
   docker compose -f "$COMPOSE" ps
   groen "teruggedraaid. De container draait weer de image uit de anker."

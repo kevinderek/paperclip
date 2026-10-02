@@ -258,7 +258,18 @@ schrijf_anker() {
     echo "HUIDIGE_LABEL=$HUIDIGE_LABEL"
     echo "HUIDIGE_ID=$HUIDIGE_ID"
     echo "# terugval 1 (als er een compose-backup ligt): ./uitrol-rek471.sh terugval"
-    echo "# terugval 2 (zonder backup): docker compose -f $COMPOSE up -d --force-recreate $HUIDIGE_LABEL"
+    if [ -n "${HUIDIGE_LABEL:-}" ] && [ "$HUIDIGE_LABEL" != "onbekend" ]; then
+      echo "# terugval 2 (zonder backup): docker compose -f $COMPOSE up -d --force-recreate $HUIDIGE_LABEL"
+    else
+      # Gemeten 2026-10-02 09:46:25Z: `docker inspect` gaf een leeg `.Config.Image`,
+      # dus HUIDIGE_LABEL was 'onbekend' en deze regel zou
+      # `up -d --force-recreate onbekend` zijn. Dat is een terugvalpad dat niet werkt,
+      # en het staat in het ankerbestand dat iemand later leest. Beter een lege regel
+      # met de handeling om het label te achterhalen dan een dode commando.
+      echo "# terugval 2 (zonder backup): niet beschikbaar, image-label onbekend."
+      echo "#   Haal het label op met:"
+      echo "#     docker inspect --format '{{.Config.Image}}' $HUIDIGE_IMAGE"
+    fi
   } | tee "$ANKER"
   groen "anker weggeschreven naar $ANKER"
 }
@@ -327,7 +338,30 @@ koppel() {
   # exit deed op precies de voorwaarde die die regel afhandelde. Dat is de oorzaak
   # van de mislukking van 07:07Z.
 
-  mv "${COMPOSE}.tmp-rek471" "$COMPOSE"
+  # `mv -f`, niet `mv`. Gemeten 2026-10-02 09:56:49Z op de host: de compose is
+  # van `root` en het script draait als `kevin`, dus mv vraagt om bevestiging en
+  # blijft hangen op
+  #
+  #   mv: replace '/home/kevin/paperclip/docker-compose.yml', overriding mode 0644 (rw-r--r--)?
+  #
+  # Een interactieve vraag in een niet-interactief script is een blokkade die er
+  #uitziet als voortgang: de build is klaar, de backup ligt, en het script
+  # wacht op een toetsaanslag. `-f` zegt precies wat hier bedoeld is — de
+  # terugvalkopie van regel hierboven ligt al op schijf, dus overschrijven is
+  # omkeerbaar.
+  #
+  # Het stukje na de mv is geen aanname maar een poort: `test -s` op de nieuwe
+  # compose plus een bytevergelijking met de tmp die er lag. Zonder die twee
+  # zou een `mv` die stilletjes niets deed eruit komen als een succes.
+  if ! mv -f "${COMPOSE}.tmp-rek471" "$COMPOSE"; then
+    rm -f "${COMPOSE}.tmp-rek471"
+    rood "mv kon de compose niet overschrijven. Terugdraaien."
+    terugdraai
+  fi
+  [ -s "$COMPOSE" ] \
+    || { rood "de compose is leeg na de mv. Terugdraaien."; terugdraai; }
+  grep -qF "$IMAGE_TAG" "$COMPOSE" \
+    || { rood "de compose bevat $IMAGE_TAG niet na de mv. Terugdraaien."; terugdraai; }
 
   kop "5b. Poort: leest de compose de nieuwe image nog terug?"
 

@@ -232,6 +232,20 @@ broncontrole() {
   [ "$(grep -c 'ISSUE_MONITOR_LIVE_STATUSES' "$BRON/server/src/services/issue-execution-policy.ts" || true)" -ge 1 ] \
     || { rood "De monitor-poort ISSUE_MONITOR_LIVE_STATUSES ontbreekt in de bron. Stop hier."; exit 1; }
   groen "REK-460 zijn parkeerstap en de UI-plekken zijn ongemoeid"
+
+  # 4. Elke aanroep van een functie in dit script moet een functie zijn.
+  #    `alles` riep `inspect` aan — een naam uit het dispatch-blok, geen functie —
+  #    en stopte met exit 127 zonder één write. Gemeten 2026-10-02. Deze poort
+  #    staat hier zodat dezelfde fout niet terugkomt als er iemand aan het
+  #    orchestratieblok werkt.
+  [ -f "$BRON/server/scripts/verify-functieaanroepen.mjs" ] \
+    || { rood "server/scripts/verify-functieaanroepen.mjs ontbreekt. Stop hier."; exit 1; }
+  if ! node "$BRON/server/scripts/verify-functieaanroepen.mjs" "$0" >/dev/null 2>&1; then
+    rood "Dit script roept een naam aan die geen functie is. Zie hierboven de regelnummers;"
+    rood "voer zelf uit voor de reden: node server/scripts/verify-functieaanroepen.mjs \$0"
+    exit 1
+  fi
+  groen "elke functieaanroep in dit script bestaat echt"
 }
 
 schrijf_anker() {
@@ -506,7 +520,19 @@ config() {
 # en de container-herstart blijft achter de handmatige bevestiging UITROL.
 alles() {
   kop "A. Volledige rit: inspect -> bouw -> koppel -> start -> rapport"
-  inspect
+  # `controleer`, niet `inspect`: `inspect` bestaat alleen als naam in het
+  # dispatch-blok, niet als functie. De vorige versie van dit script riep `inspect`
+  # aan en stopte met exit 127 op regel 509, vóór enige write.
+  #
+  # Dit is dezelfde fout als in `uitrol-rek439.sh` op 01-10, en die stond toen al in
+  # het script dat deze uitrol moest vervangen. Gemeten 2026-10-02: op een host
+  # zonder docker geeft `alles` exit 127 met `inspect: command not found`, dus de
+  # poort die vóór elke write hoort te staan, stond in werkelijkheid ná de eerste
+  # write — of liever: helemaal niet, want 127 is geen van de poort-uitkomsten.
+  #
+  # Om dat niet meer te kunnen missen roept `alles` alleen functies aan die in dit
+  # bestand gedefinieerd zijn; `controleer` is de functie, `inspect` de schermnaam.
+  controleer
   bouw
   koppel
   start

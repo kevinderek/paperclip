@@ -238,11 +238,18 @@ broncontrole() {
   #    en stopte met exit 127 zonder één write. Gemeten 2026-10-02. Deze poort
   #    staat hier zodat dezelfde fout niet terugkomt als er iemand aan het
   #    orchestratieblok werkt.
+  #  `_uit` in plaats van `>/dev/null`: een poort waarvan de reden onzichtbaar is
+  #  kost een volledige run om te repareren. Gemeten 2026-10-02 22:0xZ: de
+  #  zelfstandigheidspoort ging rood op de host met één regel uitkomst, zonder de
+  #  reden, en die reden bleek een ontbrekende `safe.directory` in de poort zelf.
+  #  Zonder de reden was dat niet te achterhalen zonder de fout lokaal te
+  #  reconstrueren. Nu staat de reden in de uitvoer die je al leest.
+  _uit="${MAP}/broncontrole-uitvoer.txt"
   [ -f "$BRON/server/scripts/verify-functieaanroepen.mjs" ] \
     || { rood "server/scripts/verify-functieaanroepen.mjs ontbreekt. Stop hier."; exit 1; }
-  if ! node "$BRON/server/scripts/verify-functieaanroepen.mjs" "$0" >/dev/null 2>&1; then
+  if ! node "$BRON/server/scripts/verify-functieaanroepen.mjs" "$0" >"$_uit" 2>&1; then
+    sed 's/^/  /' "$_uit" | head -20
     rood "Dit script roept een naam aan die geen functie is. Zie hierboven de regelnummers;"
-    rood "voer zelf uit voor de reden: node server/scripts/verify-functieaanroepen.mjs \$0"
     exit 1
   fi
   groen "elke functieaanroep in dit script bestaat echt"
@@ -267,9 +274,9 @@ broncontrole() {
   if [ "${UITROL_GATE_ZELFSTANDIG:-0}" != "1" ]; then
     [ -f "$BRON/server/scripts/verify-uitrol-zelfstandig.mjs" ] \
       || { rood "server/scripts/verify-uitrol-zelfstandig.mjs ontbreekt. Stop hier."; exit 1; }
-    if ! node "$BRON/server/scripts/verify-uitrol-zelfstandig.mjs" "$0" >/dev/null 2>&1; then
-      rood "een stap van dit script kan niet los draaien. Zie hierboven de regelnummers;"
-      rood "voer zelf uit voor de reden: node server/scripts/verify-uitrol-zelfstandig.mjs \$0"
+    if ! node "$BRON/server/scripts/verify-uitrol-zelfstandig.mjs" "$0" >"$_uit" 2>&1; then
+      sed 's/^/  /' "$_uit" | head -20
+      rood "een stap van dit script kan niet los draaien. De reden staat hierboven."
       exit 1
     fi
     groen "elke lees- en terugvalstap draait los"

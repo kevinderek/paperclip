@@ -120,9 +120,34 @@ writeFileSync(composePad, compose);
 // Een terugvalkopie, want anders stopt `terugval` terecht met "geen terugvalkopie".
 writeFileSync(join(dir, "docker-compose.yml.bak-rek471-20260101T000000Z"), compose);
 
-// De sha van de bron, zodat `broncontrole` zijn eigen vergelijking slaagt zonder git.
-const head = spawnSync("git", ["-C", bronMap, "rev-parse", "HEAD"], { encoding: "utf8" });
+// De sha van de bron, zodat `rapport` zijn STAMP-vergelijking kan slagen.
+//
+// `-c safe.directory` is hier niet decoratief. Het script zelf gebruikt die
+// uitzondering al in `git_bron` (`scripts/uitrol-rek471.sh:54`), omdat de kloon op
+// de host van `kevin` is terwijl de uitrol als `root` draait. Deze call had hem niet,
+// dus op de echte host weigerde alleen deze ene git-call en gaf de gate:
+//
+//   ROOD   rapport   exit 1 — NIET BEVESTIGD: de bezorgde container noemt
+//   cb03e1b… niet (stamp: {"commit":""}). Niet afgerond.
+//
+// Gemeten 2026-10-02 22:0xZ op de host, en na hierboven lokaal gerepliceerd door de
+// call een exit 128 te geven. Dat de gate hier rood ging en niet elders valt samen met
+// één ding: de kloon is `kevin`-eigen en de uitrol draait als root.
+const head = spawnSync("git", ["-c", "safe.directory=*", "-C", bronMap, "rev-parse", "HEAD"], {
+  encoding: "utf8",
+});
 const commit = head.status === 0 ? head.stdout.trim() : "";
+
+// Een lege commit zou `rapport` laten falen op een vergelijking die niets te maken
+// heeft met de vraag of de stappen los kunnen draaien. Dat is een storing in de
+// poort, geen uitkomst, en die moet zichtbaar zijn in plaats van te veranderen in een
+// rode die over de uitrol gaat.
+if (!commit) {
+  console.error(`kon de sha van ${bronMap} niet lezen — git gaf exit ${head.status}:`);
+  console.error((head.stderr ?? "").trim() || "(geen uitvoer)");
+  console.error("\nROOD: zonder die sha kan deze poort `rapport` niet beoordelen.");
+  process.exit(1);
+}
 
 const env = {
   ...process.env,

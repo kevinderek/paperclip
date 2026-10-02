@@ -246,6 +246,34 @@ broncontrole() {
     exit 1
   fi
   groen "elke functieaanroep in dit script bestaat echt"
+
+  # 5. Elke lees- en terugvalstap moet los kunnen draaien. `terugval` stierf op
+  #    `SERVICE: unbound variable` zodra hij zonder voorafgaande stap draaide, en de
+  #    regel die daar las was de poort op de terugval-image uit PR #13. Gemeten
+  #    2026-10-02 19:1xZ. De ergste helft: de `mv` van de terugvalkopie was al
+  #    gebeurd, dus de compose stond terug en de container was niet herstart.
+  #
+  #    Deze poort draait het script echt — nep-docker, nep-compose, los per stap —
+  #    en eist de gemeten exitcode. Zij staat hier omdat `broncontrole` de plek is
+  #    die vóór elke write draait, en een dode terugval is een schrijfactie op het
+  #    ergste moment.
+  #
+  #    De `UITROL_GATE_ZELFSTANDIG`-wacht is geen optimalisatie maar een noodzaak:
+  #    de eerste versie riep deze poort vanuit `broncontrole` aan zonder wacht, en
+  #    de poort draait zelf `config`, dat `broncontrole` aanroept, dat de poort
+  #    aanroept. Gemeten 2026-10-02: exit 124, de timeout van een oneindige lus.
+  #    De wacht zet alleen de poort hierboven over; alle andere bronpoorten draaien
+  #    gewoon door, dus de stappen die de poort meet worden volledig getest.
+  if [ "${UITROL_GATE_ZELFSTANDIG:-0}" != "1" ]; then
+    [ -f "$BRON/server/scripts/verify-uitrol-zelfstandig.mjs" ] \
+      || { rood "server/scripts/verify-uitrol-zelfstandig.mjs ontbreekt. Stop hier."; exit 1; }
+    if ! node "$BRON/server/scripts/verify-uitrol-zelfstandig.mjs" "$0" >/dev/null 2>&1; then
+      rood "een stap van dit script kan niet los draaien. Zie hierboven de regelnummers;"
+      rood "voer zelf uit voor de reden: node server/scripts/verify-uitrol-zelfstandig.mjs \$0"
+      exit 1
+    fi
+    groen "elke lees- en terugvalstap draait los"
+  fi
 }
 
 schrijf_anker() {
@@ -654,6 +682,35 @@ start() {
 }
 
 terugval() {
+  # `terugval` draait los. Het is de stap die je gebruikt als er iets mis is, dus
+  # het mag niet afhangen van een eerdere stap in dezelfde rit.
+  #
+  # Gemeten 2026-10-02 19:1xZ, twee manieren waarop het zonder voorafgaande stap
+  # stierf, allebei door `set -u`:
+  #
+  #   $ ./uitrol-rek471.sh terugval
+  #   ./uitrol-rek471.sh: line 657: COMPOSE: unbound variable      (exit 1)
+  #
+  #   $ COMPOSE=<bestaand> ./uitrol-rek471.sh terugval
+  #   ./uitrol-rek471.sh: line 679: SERVICE: unbound variable     (exit 1)
+  #
+  # De tweede is de regel die PR #13 toevoegde: de poort op de terugval-image
+  # gebruikt `$SERVICE`, en `terugval` riep `controleer` nooit aan. Dat is de
+  # klassieke vorm van deze fout — een poort die de uitrol beschermt en zelf de
+  # terugval blokkeert.
+  #
+  # En het ergste van de tweede: die `mv` op regel 11 hieronder was al gebeurd.
+  # De compose stond dus terug en de container was niet herstart, met een
+  # `unbound variable` als laatste regel in beeld. Een terugval die halverwege
+  # stopt, is erger dan een terugval die niet begint.
+  [ -n "${COMPOSE:-}" ] || { COMPOSE="$(vind_compose)" || true; }
+  [ -n "${COMPOSE:-}" ] && [ -f "$COMPOSE" ] \
+    || { rood "geen compose gevonden. Zet COMPOSE=<pad> en draai opnieuw."; exit 1; }
+  if [ -z "${SERVICE:-}" ]; then
+    mapfile -t TERUG_SERVICES < <(docker compose -f "$COMPOSE" config --services 2>/dev/null | grep -xE 'server|paperclip' || true)
+    SERVICE="${TERUG_SERVICES[0]:-server}"
+  fi
+
   BACKUP="$(ls -1t "${COMPOSE}.bak-rek471-"* 2>/dev/null | head -1 || true)"
   if [ -z "$BACKUP" ]; then
     rood "geen terugvalkopie gevonden naast $COMPOSE"

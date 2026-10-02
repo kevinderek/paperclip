@@ -604,19 +604,33 @@ start() {
   # leert vooral het vertrouwen in de poort af. De commit-claim hoort dus bij stap 8,
   # die de container-stamp leest, en stap 9, die de bezorgde code leest.
   #
-  # Wat hier wél hoort te slaan: de instance is gezond, en haar `processStartedAt`
-  # ligt ná het moment waarop deze rit de container herstartte. Dat is de lezing die
-  # een mens kan omzetten naar "de browser praat tegen de nieuwe container".
+  # Wat hier wél hoort te slaan: de instance is gezond, en de container die antwoordt
+  # is dezelfde die stap 8 las.
   HEALTH="$(curl -s --max-time 10 https://paperclip.kevinderek.com/api/health || echo '{}')"
   echo "  /api/health: $HEALTH"
   case "$HEALTH" in
     *'"status":"ok"'*) groen "de bezorgde instance meldt status ok" ;;
     *) rood "de bezorgde instance meldt geen status ok. De uitrol is niet afgerond."; exit 1 ;;
   esac
-  STARTED="$(printf '%s' "$HEALTH" | sed -n 's/.*"processStartedAt":"\([^"]*\)".*/\1/p' | head -1)"
-  echo "  processStartedAt: ${STARTED:-onleesbaar}"
-  [ -n "${STARTED:-}" ] \
-    || { rood "geen processStartedAt in /api/health. Stop hier."; exit 1; }
+
+  # De leeftijd van de bezorgde container, en NIET uit /api/health. Gemeten
+  # 2026-10-02 14:2xZ: een anonieme `curl /api/health` geeft de sleutels
+  # bootstrapInviteActive, bootstrapStatus, commit, databaseBackup,
+  # deploymentExposure, deploymentMode, features, localAiLoginSupported,
+  # serverVersion, startupRecovery, status, version — en géén `serverInfo`.
+  # `serverInfo` rijdt alleen op responses met volledige details
+  # (`server/src/routes/health.ts:249-252`), dus met een geldig token; dit script
+  # heeft er geen. Een `sed` op `processStartedAt` in die body levert dus leeg, en
+  # de eerste versie van deze poort gaf daarom op de echte instance een rode waar
+  # er niets mis was. Ik had die poort op een veld gezet dat anoniem niet bestaat.
+  #
+  # `docker inspect .State.StartedAt` is de andere lezing, en die is op deze host
+  # wel beschikbaar: het is dezelfde container die stap 8 en 9 lazen.
+  STARTED="$(docker inspect --format '{{.State.StartedAt}}' \
+             "$(docker ps --filter "label=com.docker.compose.service=$SERVICE" --format '{{.ID}}' | head -1)" 2>/dev/null || true)"
+  echo "  container StartedAt: ${STARTED:-onleesbaar}"
+  [ -n "${STARTED:-}" ] && [ "${STARTED:0:4}" != "0001" ] \
+    || { rood "geen bruikbare StartedAt op de draaiende container. Stop hier."; exit 1; }
   # `date -d` leest een ISO-8601 met seconden. Zonder de `-d ||` zou dit een lege
   # string zijn en `[ "" -gt 0 ]` een fout in `[`, wat `set -e` als een mislukking
   # van de hele stap leest.
@@ -625,9 +639,9 @@ start() {
   LEEFTIJD=$(( NU_EPOCH - STARTED_EPOCH ))
   echo "  leeftijd van de bezorgde container: ${LEEFTIJD}s"
   [ "${STARTED_EPOCH:-0}" -gt 0 ] \
-    || { rood "processStartedAt ($STARTED) is geen datum die deze host kan lezen. Stop hier."; exit 1; }
+    || { rood "StartedAt ($STARTED) is geen datum die deze host kan lezen. Stop hier."; exit 1; }
   [ "${LEEFTIJD}" -ge 0 ] \
-    || { rood "processStartedAt ligt ${LEEFTIJD}s in de toekomst. De klokken verschillen; de uitrol is niet af te beoordelen."; exit 1; }
+    || { rood "StartedAt ligt ${LEEFTIJD}s in de toekomst. De klokken verschillen; de uitrol is niet af te beoordelen."; exit 1; }
   [ "${LEEFTIJD}" -lt 3600 ] \
     || { rood "de bezorgde container is al ${LEEFTIJD}s oud en is dus niet deze herstart. Iets anders heeft 'm herstart."; exit 1; }
   groen "de browser praat tegen een container uit deze rit (${LEEFTIJD}s oud)"
@@ -742,10 +756,16 @@ rapport() {
   echo "    /api/health     : $HEALTH"
   echo "    anker           : $ANKER"
   echo "    terugval        : $MAP/$(basename "$0") terugval"
-  case "$HEALTH" in
-    *"${COMMIT}"*) groen "LIVE BEVESTIGD: de bezorgde instance noemt $COMMIT" ;;
-    *) rood "NIET BEVESTIGD: /api/health noemt $COMMIT niet. Niet afgerond."; exit 1 ;;
+  # De commit-claim hoort bij de container-stamp hierboven, niet bij /api/health.
+  # Zelfde reden als stap 11: `commit` in /api/health komt uit `.git`
+  # (`server/src/routes/health.ts:258`) en is in elke container `null`. Een rapport
+  # dat daarop rood gaat, maakt een geslaagde uitrol "niet afgerond".
+  case "$STAMP" in
+    *"${COMMIT}"*) groen "BEVESTIGD: de bezorgde container draagt de stamp $COMMIT" ;;
+    *) rood "NIET BEVESTIGD: de bezorgde container noemt $COMMIT niet (stamp: $STAMP). Niet afgerond."; exit 1 ;;
   esac
+  echo
+  echo "  /api/health noemt commit=null; dat is normaal in een container en geen afkeur."
 }
 
 case "${1:-inspect}" in

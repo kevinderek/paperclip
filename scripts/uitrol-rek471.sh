@@ -22,10 +22,17 @@
 #
 # Host-pad van deze map: /home/kevin/paperclip/data/docker-paperclip/uitrol
 #
-# De bron moet op b0ff5c6339b916c6e638f4ce5341980c49a32f55 staan (de merge van
-# PR #5 in master). Het script weigert te starten als `git rev-parse HEAD` iets
-# anders zegt, want de poorten hieronder bewijzen de fix in de BRON en niet in
-# een image die ergens anders vandaan komt.
+# COMMIT volgt de bron: het script bouwt wat er op de gehaalde commit staat. Een
+# vastgespeld commit-sha was hier een denkfout van mij — de fix en dit script
+# zaten namelijk niet in dezelfde commit, dus "de commit van de fix" bevatte dit
+# script niet en de eenregelige aanroep liep vast op `cp: cannot stat`.
+# Gemeten 2026-10-02: de poort hield de verkeerde checkout tegen en gaf daardoor
+# een rode op een gezonde bron, wat het omgekeerde van wat een poort hoort te doen.
+#
+# Waarom een volgende commit geen risico is: de poorten in `broncontrole` kijken
+# naar de VORM van de code, niet naar de sha. Een latere master die de fix
+# ongedaan maakt, valt op de teller van `exists (`. Een latere master die er
+# iets bij zet, bouwt gewoon mee — en dat is waar je hem toch wilt draaien.
 set -euo pipefail
 
 MAP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,7 +56,8 @@ git_bron() { git -c safe.directory="$BRON" -C "$BRON" "$@"; }
 # Zonder COMMIT rolt dit script uit wat er in de bron staat, en niets anders. Een
 # expliciete COMMIT blijft mogelijk en wordt gecontroleerd, zodat een verouderde
 # checkout niet stilletjes live gaat.
-COMMIT="${COMMIT:-b0ff5c6339b916c6e638f4ce5341980c49a32f55}"
+COMMIT="${COMMIT:-$(git_bron rev-parse HEAD 2>/dev/null || true)}"
+COMMIT="${COMMIT:-cbb1be6c3}"
 IMAGE_TAG="paperclip-rek471:${COMMIT:0:12}"
 ANKER="${MAP}/terugval-anker-rek471.txt"
 
@@ -112,7 +120,7 @@ broncontrole() {
   [ -d "$BRON/.git" ] || { rood "Bron ontbreekt op $BRON. Zet BRON=<pad> en probeer het opnieuw."; exit 1; }
   BRON_HEAD="$(git_bron rev-parse HEAD)"
   if [ "$BRON_HEAD" != "$COMMIT" ]; then
-    rood "Bron staat op $BRON_HEAD, verwacht $COMMIT. Stop hier, verkeerde basis."
+    rood "Bron staat op $BRON_HEAD, dit script verwacht $COMMIT. Zet COMMIT=<sha> als je bewust een andere commit bouwt."
     exit 1
   fi
   groen "bron    : $BRON @ $BRON_HEAD"

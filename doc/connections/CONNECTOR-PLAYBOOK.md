@@ -513,6 +513,9 @@ connection work or enforce a real tenant boundary. Follow these rules:
   controls and per-action Test dialog. Do not build a parallel permissions list or
   provider-specific testing page. Discovery errors stay inline on Connect; an empty
   returned catalog belongs to the ordinary saved-connection state.
+- The per-action Test dialog shows structured MCP results as readable fields,
+  tables, or cards when possible. It keeps the full raw response available for
+  diagnosis and opens it by default when the result cannot be rendered safely.
 - Enable every discovered tool automatically. Put later Allowed / Ask first / Off
   controls in management, separate from connection access. Reconnect and refresh
   retain existing restrictions; new tools are Allowed under the existing access rules.
@@ -662,8 +665,16 @@ internal discussion; a task comment or agent progress update must not imply
 that an external action occurred. Reuse existing task-feed components and
 preserve one visible record per external event.
 
+**Keep setup to one screen.** The connect screen collects only what proves who
+the user is: a provider sign-in, a key, or an endpoint. It states the default
+access in one line, with **Change** for other choices, and does not add an
+access step. Pick the ranked default method instead of asking. Put scope,
+capability, and per-action choices on the Permissions tab after the connection.
+`connectionSetupStateForMethod` in `packages/shared` classifies each method as
+`instant`, `authorize`, `paste`, or `register`; the gallery verb comes from it.
+
 **Make interactive Storybooks for setup and actual use.** Include the catalog
-card, access and credential steps, any agent-resource wizard, and the task
+card, the connect screen and its credential states, any agent-resource wizard, and the task
 journeys after setup. Provide a clickable walkthrough plus focused stories for
 important steps, loading, errors, and recovery. Use realistic fixtures and
 clearly label simulated actions. Reuse production components as implementation

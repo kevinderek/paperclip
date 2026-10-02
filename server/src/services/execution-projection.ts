@@ -1,4 +1,5 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { detoastedJsonbKeys } from "./jsonb-detoast.js";
 import {
   heartbeatRuns,
   issueRecoveryActions,
@@ -10,6 +11,12 @@ import type { ExecutionProjection } from "@paperclipai/shared";
 import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 const text = (v: unknown) => (typeof v === "string" ? v : null);
+// Eén detoast per rij, in plaats van drie losse `->` op dezelfde TOASTed kolom.
+const executionRunContextKeys = detoastedJsonbKeys(
+  heartbeatRuns.contextSnapshot,
+  ["issueId", "failureRetriesBeforeAiConnectionWait", "failureRetriesBeforeWorkspaceWait"],
+  "exec_context",
+);
 const executionRunColumns = {
   id: heartbeatRuns.id,
   errorCode: heartbeatRuns.errorCode,
@@ -28,9 +35,9 @@ const executionRunColumns = {
   startedAt: heartbeatRuns.startedAt,
   status: heartbeatRuns.status,
   contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object(
-    'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
-    'failureRetriesBeforeAiConnectionWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeAiConnectionWait',
-    'failureRetriesBeforeWorkspaceWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeWorkspaceWait')`,
+    'issueId', ${executionRunContextKeys.jsonb("issueId")},
+    'failureRetriesBeforeAiConnectionWait', ${executionRunContextKeys.jsonb("failureRetriesBeforeAiConnectionWait")},
+    'failureRetriesBeforeWorkspaceWait', ${executionRunContextKeys.jsonb("failureRetriesBeforeWorkspaceWait")})`,
 };
 type Run = Pick<typeof heartbeatRuns.$inferSelect, keyof typeof executionRunColumns>;
 type Coordinator = typeof nativeRunFinalizations.$inferSelect;
@@ -54,6 +61,7 @@ export async function executionProjectionsForRuns(
   const runs = await db
     .select(executionRunColumns)
     .from(heartbeatRuns)
+    .leftJoin(executionRunContextKeys.join, sql`true`)
     .where(
       and(
         eq(heartbeatRuns.companyId, companyId),

@@ -1,0 +1,14 @@
+{
+  "_comment": "Gemeten projectievelden van de vóór-fix `/runs`-query, bewaard als literal zodat de poort de mutant niet met zichzelf vergelijkt. De lijst is de volgorde waarin activityService.runsForIssue de velden teruggeeft.",
+  "columns": [
+    "run_id",
+    "created_at",
+    "log_bytes",
+    "c1",
+    "c2",
+    "c3",
+    "c4",
+    "usage_json",
+    "result_json"
+  ]
+}

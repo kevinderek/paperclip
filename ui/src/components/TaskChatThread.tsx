@@ -1475,6 +1475,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // The thread-level Retry no longer refetches logs, so a silent partial
       // transcript would leave the reader with no notice and no way to re-read.
       if (nativeTranscriptErrorsByRun.has(run.id)) return "error";
+      // A settled native run with no event history is read from its legacy log
+      // as a fallback (`logRuns` above). When THAT read fails there is no native
+      // error to see, so without this the run looks "ready" with an empty
+      // transcript: the thread-level bar no longer covers per-run failures, so
+      // the failure would be silent and un-retryable.
+      if (logErrorsByRun?.has(run.id)) return "error";
       const hydrating = hydratedNativeRunIds
         ? !hydratedNativeRunIds.has(run.id)
         : nativeEventsAreInitiallyHydrating;

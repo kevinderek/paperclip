@@ -479,6 +479,44 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     ).toEqual(["started-run"]);
   });
 
+  // A settled native run with no event history is read from its legacy log as a
+  // fallback. When that fallback read fails there is no native error to see, so
+  // the run looked "ready" with an empty transcript and the failure was silent.
+  it("keeps the error row when a native run's legacy fallback read fails", async () => {
+    if (runtimeMode !== "native") return;
+    const props = {
+      issueId: "issue-1",
+      comments: createLongThreadComments(),
+      onAdd: async () => {},
+      linkedRuns: [
+        retryRun,
+        {
+          ...retryRun,
+          runId: "started-run",
+          status: "succeeded" as const,
+          startedAt: "2026-08-25T18:00:00.000Z",
+        },
+      ],
+    };
+    // Native events hydrated, with no entries at all: that is what puts the run
+    // on the legacy log transport.
+    hydrate("started-run");
+    // Only the LEGACY read fails.
+    transcriptState.errorsByRun.set("started-run", new Error("boom"));
+    render(<TaskChatThread {...props} />);
+
+    const row = container.querySelector(
+      '[data-testid="transcript-slot-error-started-run"]',
+    );
+    expect(row).not.toBeNull();
+    const retry = Array.from(row!.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Retry",
+    );
+    await act(async () => retry!.click());
+    // Retrying the native transport, because the run is a native one.
+    expect(nativeTranscriptState.retriedRunIds).toEqual(["started-run"]);
+  });
+
   // A run with entries from an earlier read, whose later read failed. The
   // thread-level Retry no longer refetches logs, so without an error row this
   // reader gets a partial transcript with no notice and no way to re-read.

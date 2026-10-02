@@ -32,8 +32,37 @@ const CELLEN = [
   { ref: "REK-311", uuid: "6a532b58-c775-434c-80ac-ed226813fab3", nulRuns: 20 },
   { ref: "REK-470", uuid: "71a55a37-35a6-4f56-b9e8-b7f1b9e72e19", nulRuns: 4 },
   { ref: "REK-469", uuid: "d607a942-15a0-4fc7-a79e-436ccaf09853", nulRuns: 3 },
-] as const;
+];
 
+// `--cel REF=uuid` overschrijft één uuid. Dat is er voor de negatieve toets: een
+// cel met een uuid die niet bestaat geeft HTTP 404 en ~30 ms, en zonder de
+// overschrijving zou die poort nooit te zien krijgen.
+const celOverride = arg("cel", "");
+if (celOverride) {
+  const [ref, uuid] = celOverride.split("=");
+  const cel = CELLEN.find((c) => c.ref === ref);
+  if (!cel) {
+    console.error(`onbekende cel: ${ref}. Bekend: ${CELLEN.map((c) => c.ref).join(", ")}`);
+    process.exit(2);
+  }
+  if (!uuid) {
+    console.error(`--cel ${ref}= verwacht een uuid`);
+    process.exit(2);
+  }
+  cel.uuid = uuid;
+}
+
+/**
+ * Meet `samples` keer en geef de mediaan terug, maar alleen over de samples die
+ * HTTP 200 waren.
+ *
+ * Die filter is geen cosmetiek. Gemeten 2026-10-02: een cel die 404 geeft
+ * antwoordt binnen ~30 ms met 27 bytes, en die 30 ms is een *gemiddelde* dat
+ * door de mediaan zou lopen als het er allemaal 200 waren. Dan leest een
+ * doodgeslagen route als de snelste van de tabel, en dat is precies de vorm
+ * van de claim die dit issue verbiedt. Zie `verify-200-vlag.mjs` voor de
+ * negatieve toets.
+ */
 async function meet(url: string) {
   const metingen: { ms: number; http: string; bytes: number }[] = [];
   for (let i = 0; i < samples; i++) {
@@ -46,24 +75,37 @@ async function meet(url: string) {
       bytes: body.byteLength,
     });
   }
-  const tijd = metingen.map((m) => m.ms).sort((a, b) => a - b);
+  const goed = metingen.filter((m) => m.http === "200");
+  const tijd = goed.map((m) => m.ms).sort((a, b) => a - b);
   return {
-    mediaan: tijd[Math.floor(tijd.length / 2)],
-    min: tijd[0],
-    max: tijd[tijd.length - 1],
-    http: metingen[0].http,
-    bytes: metingen[0].bytes,
-    vloerHttp: [...new Set(metingen.map((m) => m.http))],
+    mediaan: tijd.length ? tijd[Math.floor(tijd.length / 2)] : null,
+    min: tijd.length ? tijd[0] : null,
+    max: tijd.length ? tijd[tijd.length - 1] : null,
+    http: goed.length ? "200" : [...new Set(metingen.map((m) => m.http))].join(","),
+    bytes: goed.length ? goed[0].bytes : null,
+    goedeSamples: goed.length,
+    alleSamples: metingen.length,
+    fouten: metingen.filter((m) => m.http !== "200").map((m) => `${m.http}/${m.bytes}B`),
   };
 }
 
+const poort: string[] = [];
 const rijen: Record<string, unknown>[] = [];
 for (const cel of CELLEN) {
   const url = `${apiUrl}/api/issues/${cel.uuid}/runs`;
-  const lijst = await fetch(url, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json());
+  const eerst = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const body = await eerst.text();
+  const lijst = eerst.status === 200 ? JSON.parse(body) : null;
   const m = await meet(url);
-  rijen.push({ ref: cel.ref, uuid: cel.uuid, runs: Array.isArray(lijst) ? lijst.length : null, nulRuns: cel.nulRuns, ...m });
-  console.log(`${cel.ref.padEnd(8)} runs=${String(lijst.length).padStart(4)}  mediaan ${String(m.mediaan).padStart(6)} ms  (min ${m.min}, max ${m.max})  HTTP ${m.http}  ${m.bytes} bytes`);
+  const runs = Array.isArray(lijst) ? lijst.length : null;
+  // De run-teller hoort bij de meting van dezelfde cel. Zonder deze poort kan
+  // een lijst stiller worden terwijl de route even snel blijft, en dan
+  // vergelijk je twee verschillende dingen.
+  const tellerKlopt = runs !== null && runs > 0;
+  if (!tellerKlopt) poort.push(`${cel.ref}: geen bruikbare run-lijst (HTTP ${eerst.status}, ${body.length}B)`);
+  else if (m.mediaan === null) poort.push(`${cel.ref}: geen van de ${samples} samples was HTTP 200 (${m.fouten.join(", ")})`);
+  rijen.push({ ref: cel.ref, uuid: cel.uuid, runs, nulRuns: cel.nulRuns, ...m });
+  console.log(`${cel.ref.padEnd(8)} runs=${String(runs ?? "?").padStart(4)}  mediaan ${String(m.mediaan ?? "?").padStart(6)} ms  (min ${m.min}, max ${m.max})  HTTP ${m.http}  ${m.bytes} bytes`);
 }
 
 const vloer = await meet(`${apiUrl}/api/agents/me`);
@@ -86,6 +128,17 @@ if (vergelijkPad) {
 }
 
 if (uitPad) {
-  writeFileSync(uitPad, JSON.stringify({ gemetenOp: new Date().toISOString(), samples, rijen, vloer }, null, 2));
+  writeFileSync(uitPad, JSON.stringify({ gemetenOp: new Date().toISOString(), samples, rijen, vloer, poort }, null, 2));
   console.log(`\nweggeschreven: ${uitPad}`);
 }
+
+// De uitkomst van deze meting is pas bruikbaar als elke cel echt is gemeten.
+// Een 404 levert ~30 ms en 27 bytes op, en die zou als "de route is nu snel"
+// lezen. Daarom stopt het script hier in plaats van een tabel te schrijven.
+if (poort.length > 0) {
+  console.error("");
+  for (const regel of poort) console.error(`  ${regel}`);
+  console.error(`\nROOD: ${poort.length} cellen zijn niet bruikbaar. Er is geen vergelijkingstabel.`);
+  process.exit(1);
+}
+console.log("\nGROEN: elke cel heeft een bruikbare run-lijst en minstens één HTTP 200.");

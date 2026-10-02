@@ -1,3 +1,4 @@
+import { TaskBrowserActivity } from "../task-side-panel/TaskBrowserActivity";
 import { TaskChatProjectCreatedCard } from "./TaskChatProjectCreatedCard";
 import { TaskChatSkillCreatedCard } from "./TaskChatSkillCreatedCard";
 import { useMemo, type ReactNode } from "react";
@@ -81,6 +82,7 @@ interface TaskChatThreadViewProps {
    * hundreds of requests for one broken run.
    */
   onRetryTranscript?: (runId: string) => void;
+  onOpenBrowser?: (browserId: string) => void;
 }
 
 function renderItem(
@@ -103,8 +105,10 @@ function renderItem(
   attachments: IssueAttachment[] = [],
   onOpenSkill?: (skillId: string, name: string) => void,
   onRetryTranscript?: (runId: string) => void,
+  onOpenBrowser?: (browserId: string) => void,
 ) {
   switch (item.kind) {
+    case "browser": return <TaskBrowserActivity browser={item.browser} label={item.label} onOpen={onOpenBrowser} />;
     case "project_created": return <TaskChatProjectCreatedCard item={item} />;
     case "skill_created": return <TaskChatSkillCreatedCard item={item} onOpen={onOpenSkill} />;
     case "message": {
@@ -146,6 +150,7 @@ function renderItem(
               undefined,
               attachments,
               onOpenSkill,
+              onOpenBrowser,
             )
           }
         />
@@ -252,6 +257,7 @@ function renderItem(
               undefined,
               attachments,
               onOpenSkill,
+              onOpenBrowser,
             )
           }
         />
@@ -344,6 +350,7 @@ export function TaskChatThreadView({
   scroll = true,
   attachments = EMPTY_ATTACHMENTS,
   onOpenSkill,
+  onOpenBrowser,
 }: TaskChatThreadViewProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
   const retryableMarkerId =
@@ -381,6 +388,7 @@ export function TaskChatThreadView({
               attachments,
               onOpenSkill,
               onRetryTranscript,
+              onOpenBrowser,
             ),
           }))
           .filter((entry) => entry.content !== null)
@@ -431,8 +439,9 @@ export function TaskChatThreadView({
                   onRetryFailedRun,
                   retryFailedRunId,
                   attachments,
-                  undefined,
+                  onOpenSkill,
                   onRetryTranscript,
+                  onOpenBrowser,
                 )}
               </div>
             ))}
@@ -443,7 +452,7 @@ export function TaskChatThreadView({
     renderInteraction, renderBrief, renderMessageActions, renderQueuedAction,
     onTryAgainNoLiveExecutionPath, tryAgainNoLiveExecutionPathPending,
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill,
-    onRetryTranscript,
+    onRetryTranscript, onOpenBrowser,
   ]);
   const body = (
     <div

@@ -1,5 +1,6 @@
+import { TextAttachmentContext } from "../context/TextAttachmentContext";
+import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
-import { useUserPreferences } from "../hooks/useUserPreferences";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { mergeComposerRunSettings, type ComposerRunSettings } from "@/components/task-chat/composer-run-settings";
@@ -111,6 +112,7 @@ import {
   resolveIssueActiveRun,
   shouldTrackIssueActiveRun,
 } from "../lib/issueActiveRun";
+import { prefetchIssueThread } from "../lib/issue-thread-queries";
 import { getIssueDetailQueryOptions } from "../lib/issueDetailCache";
 import {
   beginIssueDetailNavigation,
@@ -295,6 +297,7 @@ import { copyTextToClipboard } from "../lib/clipboard";
 import { buildIssuePropertiesPanelKey } from "../lib/issue-properties-panel-key";
 import { openSkillPanelState, shouldSuppressTaskPanelUntilPlan } from "../lib/task-side-panel-state";
 import {
+  interactionReadinessRefetchInterval,
   buildAnsweredQuestionsDeliveryText,
   buildIssueThreadInteractionSummary,
 } from "../lib/issue-thread-interactions";
@@ -1180,6 +1183,9 @@ function InboxMobileToolbar({
 }
 
 type IssueDetailChatTabProps = {
+  queryIssueId?: string;
+  browsers?: import("@paperclipai/shared").TaskBrowser[];
+  onOpenBrowser?: (browserId: string) => void;
   onOpenSkill?: (skillId: string, name: string) => void;
   issueId: string;
   companyId: string;
@@ -1217,6 +1223,7 @@ type IssueDetailChatTabProps = {
   comments: IssueDetailComment[];
   commentsInitialLoading?: boolean;
   initialHistoryPending?: boolean;
+  initialMetadataPending?: boolean;
   initialHistoryError?: boolean;
   onRetryInitialHistory?: () => void;
   locallyQueuedCommentRunIds: ReadonlyMap<string, string>;
@@ -1331,6 +1338,9 @@ type IssueDetailChatTabProps = {
 };
 
 const IssueDetailChatTab = memo(function IssueDetailChatTab({
+  queryIssueId,
+  browsers,
+  onOpenBrowser,
   onOpenSkill,
   issueId,
   companyId,
@@ -1359,6 +1369,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   comments,
   commentsInitialLoading = false,
   initialHistoryPending = false,
+  initialMetadataPending = false,
   initialHistoryError = false,
   onRetryInitialHistory,
   locallyQueuedCommentRunIds,
@@ -1435,6 +1446,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     ? IssueChatThread
     : TaskChatThread;
   const queryClient = useQueryClient();
+  const issueQueryRef = queryIssueId ?? issueId;
   const scrollLocation = useLocation();
   const scrollNavigationType = useNavigationType();
   const { pushToast } = useToastActions();
@@ -1444,10 +1456,10 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     isError: activityError,
     refetch: refetchActivity,
   } = useQuery({
-    queryKey: queryKeys.issues.activity(issueId),
-    queryFn: () => activityApi.forIssue(issueId),
+    queryKey: queryKeys.issues.activity(issueQueryRef),
+    queryFn: () => activityApi.forIssue(issueQueryRef),
     enabled: !!issueId,
-    placeholderData: keepPreviousDataForSameQueryTail<ActivityEvent[]>(issueId),
+    placeholderData: keepPreviousDataForSameQueryTail<ActivityEvent[]>(issueQueryRef),
   });
   const {
     data: liveRuns,
@@ -1455,12 +1467,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     isError: liveRunsError,
     refetch: refetchLiveRuns,
   } = useQuery({
-    queryKey: queryKeys.issues.liveRuns(issueId),
-    queryFn: () => heartbeatsApi.liveRunsForIssue(issueId),
+    queryKey: queryKeys.issues.liveRuns(issueQueryRef),
+    queryFn: () => heartbeatsApi.liveRunsForIssue(issueQueryRef),
     enabled: !!issueId,
     refetchInterval: 1000,
     placeholderData:
-      keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(issueId),
+      keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(issueQueryRef),
   });
   const resolvedLiveRuns = liveRuns ?? [];
   const liveRunCount = resolvedLiveRuns.length;
@@ -1472,12 +1484,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     isError: activeRunError,
     refetch: refetchActiveRun,
   } = useQuery({
-    queryKey: queryKeys.issues.activeRun(issueId),
-    queryFn: () => heartbeatsApi.activeRunForIssue(issueId),
+    queryKey: queryKeys.issues.activeRun(issueQueryRef),
+    queryFn: () => heartbeatsApi.activeRunForIssue(issueQueryRef),
     enabled: activeRunQueryEnabled,
     refetchInterval: liveRunCount > 0 ? false : 1000,
     placeholderData: keepPreviousDataForSameQueryTail<ActiveRunForIssue | null>(
-      issueId,
+      issueQueryRef,
     ),
   });
   const resolvedActiveRun = useMemo(
@@ -1542,12 +1554,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     isError: linkedRunsError,
     refetch: refetchLinkedRuns,
   } = useQuery({
-    queryKey: queryKeys.issues.runs(issueId),
-    queryFn: () => activityApi.runsForIssue(issueId),
+    queryKey: queryKeys.issues.runs(issueQueryRef),
+    queryFn: () => activityApi.runsForIssue(issueQueryRef),
     enabled: !!issueId,
     refetchInterval:
       hasLiveRuns || issueStatus === "in_progress" ? 1000 : false,
-    placeholderData: keepPreviousDataForSameQueryTail<RunForIssue[]>(issueId),
+    placeholderData: keepPreviousDataForSameQueryTail<RunForIssue[]>(issueQueryRef),
   });
   const resolvedActivity = activity ?? [];
   const resolvedLinkedRuns = linkedRuns ?? [];
@@ -1572,13 +1584,13 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     },
     onSettled: () => {
       queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.runs(issueId),
+        queryKey: queryKeys.issues.runs(issueQueryRef),
       });
       queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.liveRuns(issueId),
+        queryKey: queryKeys.issues.liveRuns(issueQueryRef),
       });
       queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.activeRun(issueId),
+        queryKey: queryKeys.issues.activeRun(issueQueryRef),
       });
     },
     onError: (error) => {
@@ -2166,7 +2178,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             queryKey: queryKeys.issues.comments(issueId),
           }),
           queryClient.invalidateQueries({
-            queryKey: queryKeys.issues.activity(issueId),
+            queryKey: queryKeys.issues.activity(issueQueryRef),
           }),
         ]);
         storeQueuedCommentQueue(nextQueue);
@@ -2188,6 +2200,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       effectiveQueuedCommentQueue?.queueId,
       effectiveQueuedCommentQueue?.targetRunId,
       issueId,
+      issueQueryRef,
       queryClient,
       refreshQueueAfterConflict,
       storeQueuedCommentQueue,
@@ -2322,17 +2335,28 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             key={conversationMode ? draftKey : issueId}
             {...(!classicTaskInterfaceEnabled ? { creationActivity: resolvedActivity } : {})}
             onOpenSkill={onOpenSkill}
+            browsers={browsers}
+            onOpenBrowser={onOpenBrowser}
+            hasOlderComments={hasOlderComments}
             initialHistoryPending={!!issueId && (
               initialHistoryPending ||
               commentsInitialLoading ||
-              activityPending ||
-              // REK-311: the runs list is no longer part of the reveal gate.
-              // It used to make the whole conversation wait for the list route
-              // (4,9 s on REK-234, 29-09 11:3xZ) before a single message could
-              // render. Runs still gate their own transcript placeholders, and
-              // `linkedRunsError` stays in the message error bar below.
-              !runtimeSelectionKnown)
-            }
+              // Saved replies and the description can render while supporting
+              // history loads. Only an otherwise empty thread needs that data
+              // before deciding whether it has anything to show.
+              //
+              // REK-311: `linkedRunsPending` (the /runs list, 4,9 s on
+              // REK-234, 29-09 11:3xZ) is deliberately NOT gated here any more,
+              // not even on the classic interface. Runs gate their own
+              // transcript placeholders below, and `linkedRunsError` stays in
+              // the message error bar, so an empty thread degrades to "no
+              // messages" instead of waiting out the list route.
+              ((classicTaskInterfaceEnabled || (commentsForThread.length === 0 && !issueBrief?.description)) && (
+                initialMetadataPending ||
+                activityPending ||
+                !runtimeSelectionKnown
+              ))
+            )}
             initialHistoryError={
               initialHistoryError ||
               activityError ||
@@ -2909,6 +2933,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     requestId: number;
     handled?: boolean;
   } | null>(null);
+  const [openAttachment, setOpenAttachment] = useState<{ issueId: string; id: string; title: string; requestId: number } | null>(null);
   const [openSkill, setOpenSkill] = useState<{ id: string; name: string } | null>(null);
   const handleSkillOpened = useCallback((skillId: string) => {
     setOpenSkill((current) => current?.id === skillId ? null : current);
@@ -2999,6 +3024,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }),
     enabled: !!issueId,
   });
+  useEffect(() => {
+    if (issueId) void prefetchIssueThread(queryClient, issueId);
+  }, [issueId, queryClient]);
   const issue = queriedIssue ?? conversation?.issue ?? draftIssue;
   const resolveWritableIssueId = async () => {
     if (!conversation) return issueId!;
@@ -3091,12 +3119,12 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   }, [issue?.id]);
 
   useEffect(() => {
-    if (!issue || commentsLoading) return;
+    if (!classicTaskInterfaceEnabled || !issue || commentsLoading) return;
     scheduleIssueDetailPaintMeasure(
       ISSUE_DETAIL_CONTENT_PAINT_MARK,
       ISSUE_DETAIL_CONTENT_MEASURE,
     );
-  }, [commentsLoading, issue?.id]);
+  }, [classicTaskInterfaceEnabled, commentsLoading, issue?.id]);
   const linkedCommentId = location.hash.startsWith("#comment-")
     ? location.hash.slice("#comment-".length)
     : null;
@@ -3135,7 +3163,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: !!issueId,
     // A review can be committed between the initial fetch and live-socket
     // subscription. Reconcile even after its originating run has ended.
-    refetchInterval: 20_000,
+    refetchInterval: (query) => interactionReadinessRefetchInterval(query.state.data, 20_000),
     placeholderData: keepPreviousDataForSameQueryTail<IssueThreadInteraction[]>(
       issueId ?? "pending",
     ),
@@ -3393,7 +3421,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: !!issueId,
     retry: false,
   });
-  const keyboardShortcutsEnabled = useUserPreferences().data?.keyboardShortcuts === true;
   // Experimental Cases: linkify `PAP-C7` chips in this issue's comment bodies.
   const casesChipsEnabled = instanceExperimentalSettings?.enableCases === true;
   const feedbackDataSharingPreference =
@@ -3606,6 +3633,21 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }
     setPanelVisible(true);
   }, [issue?.id, setPanelVisible, suppressPanelUntilPlan]);
+  const handleAttachmentOpened = useCallback(() => setOpenAttachment(null), []);
+  const handleOpenTextAttachment = useCallback((id: string, title: string) => {
+    if (!issue?.id) return;
+    setOpenAttachment({ issueId: issue.id, id, title, requestId: Date.now() });
+    openTaskSidePanel();
+    if (isMobile) setMobilePropsOpen(true);
+  }, [issue?.id, openTaskSidePanel, isMobile]);
+  const browserQuery = useTaskBrowsers(issue?.id);
+  const { openBrowserId, openBrowser: setOpenBrowserId, acknowledgeBrowserOpened: handleBrowserOpened } =
+    useBrowserArrivals(currentUserId ?? "anonymous", issue?.id, browserQuery.data);
+  useEffect(() => {
+    if (!openBrowserId) return;
+    openTaskSidePanel();
+    if (isMobile) setMobilePropsOpen(true);
+  }, [openBrowserId, openTaskSidePanel, isMobile]);
   const handleOpenSkill = useCallback((skillId: string, name: string) => {
     const next = openSkillPanelState(
       { panelBeforePlanOverrideIssueId },
@@ -5676,6 +5718,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       checkingMonitorNow: checkIssueMonitorNow.isPending,
       documentDeepLink:
         documentDeepLink?.issueId === panelIssue.id ? documentDeepLink : null,
+      onAttachmentOpened: handleAttachmentOpened,
+      openAttachment: !isMobile && openAttachment?.issueId === panelIssue.id ? openAttachment : null,
       openSkillId: openSkill?.id ?? null,
       openSkillName: openSkill?.name ?? null,
       onSkillOpened: handleSkillOpened,
@@ -5684,6 +5728,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       openPanel(
         <IssueGalleryContext.Provider value={openIssueGallery}>
           <TaskSidePanel
+            openBrowserId={openBrowserId}
+            onBrowserOpened={handleBrowserOpened}
             key={panelIssue.id}
             {...sharedProps}
             accountScope={currentUserId ?? "anonymous"}
@@ -5707,12 +5753,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }
     return () => closePanel();
   }, [
+    openBrowserId,
+    handleBrowserOpened,
     closePanel,
     openIssueGallery,
     handleIssuePropertiesUpdate,
     issuePanelKey,
     openNewSubIssue,
     openPanel,
+    openAttachment,
+    handleAttachmentOpened,
     openSkill,
     handleSkillOpened,
     panelChildIssues,
@@ -5740,8 +5790,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   const goToInboxShortcutArmedRef = useRef(false);
   const goToInboxShortcutTimeoutRef = useRef<number | null>(null);
-  const canQuickArchiveFromInbox =
-    keyboardShortcutsEnabled && !issue?.hiddenAt;
+  const canQuickArchiveFromInbox = !issue?.hiddenAt;
 
   useEffect(() => {
     if (!issue?.id || !canQuickArchiveFromInbox) return;
@@ -5772,15 +5821,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   }, [archiveFromInbox, canQuickArchiveFromInbox, issue?.id]);
 
   useEffect(() => {
-    if (!keyboardShortcutsEnabled) {
-      goToInboxShortcutArmedRef.current = false;
-      if (goToInboxShortcutTimeoutRef.current !== null) {
-        window.clearTimeout(goToInboxShortcutTimeoutRef.current);
-        goToInboxShortcutTimeoutRef.current = null;
-      }
-      return;
-    }
-
     const clearArmTimeout = () => {
       if (goToInboxShortcutTimeoutRef.current !== null) {
         window.clearTimeout(goToInboxShortcutTimeoutRef.current);
@@ -5869,7 +5909,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     };
   }, [
     fileViewerEnabled,
-    keyboardShortcutsEnabled,
     navigate,
     sourceBreadcrumb.href,
   ]);
@@ -7415,7 +7454,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   return (
     <FileViewerProvider issueId={conversation && !conversation.issue ? "" : issue.id} enabled={fileViewerEnabled}>
-      <IssueGalleryContext.Provider value={openIssueGallery}>
+      <TextAttachmentContext.Provider value={taskChatShellEnabled ? handleOpenTextAttachment : null}><IssueGalleryContext.Provider value={openIssueGallery}>
         <div
           data-task-chat-shell={taskChatShellEnabled ? "" : undefined}
           className={
@@ -7769,8 +7808,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   onRetry: (actionId) => retryDispositionRecovery.mutateAsync(actionId).then(() => undefined),
                 }}>
                 <IssueDetailChatTab
+                  queryIssueId={issueId ?? issue.id}
                   onOpenSkill={handleOpenSkill}
-                  threadHeader={<>{taskChatThreadHeader}{instanceExperimentalSettings?.enableChatConnectors && <EmailTaskActivity key={issue.id} companyId={issue.companyId} issueId={issue.id} />}</>}
+                  browsers={browserQuery.data}
+                  onOpenBrowser={(id) => { setOpenBrowserId(id); if (isMobile) setMobilePropsOpen(true); else openTaskSidePanel(); }}
+                  threadHeader={<>{taskChatThreadHeader}<EmailTaskActivity key={issue.id} companyId={issue.companyId} issueId={issue.id} /></>}
                   issueBrief={
                     // Suppress the seeded-description bubble for the onboarding first
                     // task: its description is agent instructions, not something the
@@ -7847,8 +7889,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   legacyRecoverySourceIssue={legacyRecoverySourceIssue}
                   comments={threadComments}
                   commentsInitialLoading={commentsLoading}
-                  initialHistoryPending={
-                    linkedCommentPending ||
+                  initialHistoryPending={linkedCommentPending}
+                  initialMetadataPending={
                     interactionsLoading ||
                     attachmentsLoading ||
                     workProductsLoading
@@ -8162,6 +8204,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     <SheetTitle>Task side panel</SheetTitle>
                   </SheetHeader>
                   <TaskSidePanel
+                    openBrowserId={openBrowserId}
+                    onBrowserOpened={handleBrowserOpened}
                     key={`${issue.id}:mobile`}
                     issue={issue}
                     accountScope={currentUserId ?? "anonymous"}
@@ -8204,6 +8248,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     artifactsOpenRequestId={isMobile && !artifactsOpenRequest?.handled && artifactsOpenRequest?.issueId === issue.id
                       ? artifactsOpenRequest.requestId : undefined}
                     onArtifactsOpened={handleArtifactsOpened}
+                    onAttachmentOpened={handleAttachmentOpened}
+                    openAttachment={openAttachment?.issueId === issue.id ? openAttachment : null}
                     openSkillId={openSkill?.id ?? null}
                     openSkillName={openSkill?.name ?? null}
                     onSkillOpened={handleSkillOpened}
@@ -8283,7 +8329,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           ) : null}
           <ScrollToBottom />
         </div>
-      </IssueGalleryContext.Provider>
+      </IssueGalleryContext.Provider></TextAttachmentContext.Provider>
     </FileViewerProvider>
   );
 }

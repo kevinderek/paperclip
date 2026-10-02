@@ -152,12 +152,48 @@ broncontrole() {
   EXEC_AAN="$(grep -c 'executionRunContextKeys' "$BRON/server/src/services/execution-projection.ts" || true)"
   [ "${EXEC_AAN:-0}" -ge 1 ] \
     || { rood "execution-projection.ts gebruikt executionRunContextKeys niet. Stop hier."; exit 1; }
+  # Gezocht wordt de AANROEP, niet het woord: twee van de drie treffers op
+  # `jsonb_each` in dat bestand staan in een commentaar. Gemeten 2026-10-02: een
+  # poort die `grep -c jsonb_each` deed gaf groen op een bron waarin de lateral
+  # `jsonb_array_elements` gebruikte, en dat is een andere query.
+  JSONB_EACH="$(grep -c 'from jsonb_each(' "$BRON/server/src/services/jsonb-detoast.ts" || true)"
+  [ "${JSONB_EACH:-0}" -ge 1 ] \
+    || { rood "De lateral gebruikt jsonb_each niet meer (from jsonb_each( ontbreekt). Stop hier."; exit 1; }
   # Drie losse `->` op contextSnapshot in execution-projection was de tweede helft
   # van de per-run kost; die moet weg zijn.
-  DRIE_DEREFS="$(grep -c "contextSnapshot}->'" "$BRON/server/src/services/execution-projection.ts" || true)"
+  DRIE_DEREFS="$(grep -c 'contextSnapshot}->' "$BRON/server/src/services/execution-projection.ts" || true)"
   [ "${DRIE_DEREFS:-0}" = "0" ] \
     || { rood "execution-projection.ts heeft nog $DRIE_DEREFS losse contextSnapshot-derefs. Stop hier."; exit 1; }
-  groen "de lateral staat in de bron (jsonb_each, $DETOAST_AAN treffers, execution-projection schoon)"
+
+  # En in activity.ts zelf, op de selectie-lijst. `usage_json` en `result_json`
+  # hebben daar geen enkele wettelijke `->`, dus elke treffer is een
+  # teruggedraaide fix. `context_snapshot` heeft er wél twee, en die moeten
+  # blijven: het zijn de predikaten van de liveness-backfill en van de
+  # IN-subquery. Zonder die kan de planner de expressie-index niet gebruiken, en
+  # dat is precies de 1,2 s die deze uitrol weghaalt.
+  #
+  # Alle losse derefs op de vier contextSnapshot-sleutels, en daarvan de twee
+  # wettelijke predikaten. De selectie-lijst heeft er nul, dus het verschil moet
+  # nul zijn.
+  #
+  # Eerder was dit een anker op een staart-karakter, en dat had twee gaten: de
+  # selectie-lijst sluit een template af met een backtick, niet met een komma of
+  # accolade. Gemeten 2026-10-02: een mutant die `contextIssueId` en
+  # `wakeCommentIds` terugzet op losse derefs gaf groen.
+  #
+  # Ook de poort op het referentiebestand moest scherper: `grep -q` op de bestandsnaam
+  # vond de naam nog terug in het commentaar bovenaan de poort. Gemeten
+  # 2026-10-02: een mutant die alleen de eerste van twee treffers hernoemde gaf
+  # groen.
+  ALLE_DEREFS="$(grep -cE "heartbeatRuns\.usageJson\} ->|heartbeatRuns\.resultJson\} ->|contextSnapshot\} ->(>)? .(wakeCommentIds|wakeCommentId|commentId|issueId)." "$BRON/server/src/services/activity.ts" || true)"
+  PRED_AAN="$(grep -cE "contextSnapshot\} ->(>)? .issueId. = " "$BRON/server/src/services/activity.ts" || true)"
+  SELECT_DEREFS=$(( ALLE_DEREFS - PRED_AAN ))
+  [ "${SELECT_DEREFS:-0}" = "0" ] ||
+    { rood "activity.ts heeft $SELECT_DEREFS losse -> in de selectie (van $ALLE_DEREFS totaal, $PRED_AAN wettelijk). De lateral is (deels) teruggedraaid. Stop hier."; exit 1; }
+  # De twee wettelijke predikaten moeten er wél staan, anders is de index-vorm weg.
+  [ "${PRED_AAN:-0}" = "2" ] ||
+    { rood "activity.ts heeft $PRED_AAN predikaten op contextSnapshot->>'issueId'; verwacht 2 (backfill + IN-subquery). Stop hier."; exit 1; }
+  groen "de lateral staat in de bron (from jsonb_each, $DETOAST_AAN treffers, 0 losse selectie-derefs, 2 wettelijke predikaten, execution-projection schoon)"
 
   # 3. De poort die de fix beweest, moet in de bron zitten. Zonder haar zou een
   #    image zonder regressietest door de poort komen, en dan is er na een
@@ -166,8 +202,11 @@ broncontrole() {
     || { rood "server/scripts/verify-runs-detoast-gate.mts ontbreekt. Stop hier."; exit 1; }
   [ -f "$BRON/server/scripts/runs-reference-query.json" ] \
     || { rood "server/scripts/runs-reference-query.json ontbreekt. Stop hier."; exit 1; }
-  grep -q "runs-reference-query.json" "$BRON/server/scripts/verify-runs-detoast-gate.mts" \
-    || { rood "De poort leest de bewaarde referentie niet. Stop hier."; exit 1; }
+  # De naam moet in de poort staan waar hij gebruikt wordt: in de URL die hij
+  # opent. Een `grep -q` over het hele bestand is te zwak, want de naam staat ook
+  # in het commentaar bovenaan. Gemeten 2026-10-02: mutant gaf groen.
+  grep -qE 'new URL\("\./runs-reference-query\.json"' "$BRON/server/scripts/verify-runs-detoast-gate.mts" \
+    || { rood "De poort leest runs-reference-query.json niet als bron van de verwachting. Stop hier."; exit 1; }
   groen "de regressiepoort en haar bewaarde referentie staan in de bron"
 
   # ---- De plekken die buiten deze wijziging moeten blijven ----

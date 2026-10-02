@@ -51,10 +51,19 @@ if (!pad) {
 const scriptAbs = resolve(pad);
 const bron = readFileSync(scriptAbs, "utf8");
 
-// BRON moet de repo zijn, want `broncontrole` leest daaruit. Vandaar: de map twee
-// niveaus omhoog vanaf scripts/. Dat is de enige manier om het script te draaien
-// zonder hem aan te passen, en aanpassen zou de poort blind maken.
-const bronMap = resolve(dirname(scriptAbs), "..");
+// BRON moet de repo zijn, want `broncontrole` leest daaruit. Maar het script wordt
+// NIET in de repo gedraaid: het wordt naast de kloon gekopieerd, dus op de host
+// ligt het op `.../data/docker-paperclip/uitrol/uitrol-rek471.sh` en zou `..` de
+// map `docker-paperclip` geven in plaats van de repo. Gemeten 2026-10-02 19:3xZ:
+// de eerste versie rekende `dirname(script)/..` en gaf op een verse kloon
+// `een stap van dit script kan niet los draaien`, dus de poort sloot de echte
+// uitrol juist dicht.
+//
+// Dus: `$BRON` uit de omgeving als die er is, en anders de repo naast het script
+// (het geval waarin iemand vanuit de checkout test).
+const bronMap = process.env.BRON
+  ? resolve(process.env.BRON)
+  : resolve(dirname(scriptAbs), "..");
 
 // Stappen die niets bouwen, schrijven of herstarten, met de exitcode die ze moeten
 // geven als ze los kunnen draaien. `controleer` is bewust niet in de lijst: dat is

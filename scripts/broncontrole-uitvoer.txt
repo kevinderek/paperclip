@@ -1,0 +1,15 @@
+script        : /tmp/mastercheck/scripts/uitrol-rek471.sh
+functies      : 12 — alles, bouw, broncontrole, config, controleer, koppel, rapport, schrijf_anker, start, terugdraai, terugval, vind_compose
+aanroepen     : 16
+dispatch-regels: 8
+
+  ok       inspect    -> controleer   (regel 836)
+  ok       bouw       -> bouw         (regel 837)
+  ok       koppel     -> koppel       (regel 838)
+  ok       start      -> start        (regel 839)
+  ok       terugval   -> terugval     (regel 840)
+  ok       config     -> config       (regel 841)
+  ok       rapport    -> rapport      (regel 842)
+  ok       alles      -> alles        (regel 843)
+
+GROEN: elke aanroep heeft een functie

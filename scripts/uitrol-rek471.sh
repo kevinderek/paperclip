@@ -470,6 +470,50 @@ koppel() {
 start() {
   controleer
   schrijf_anker
+
+  # De poort die het mislukken van 02-10 11:0xZ–11:47Z voorkomt.
+  #
+  # Gemeten, en het is geen gok: de container die om 11:47:30Z van start ging draaide
+  # `paperclip-rek471:167c5cdbf630` — de tag die op dat moment in de compose stond
+  # — maar met de BRON van 25-09 erin. Drie onafhankelijke aanwijzingen:
+  #
+  #   1. `/app/server/dist/build-info.json` bestond niet. Die schrijft
+  #      `scripts/write-build-stamp.mjs` alleen als `PAPERCLIP_BUILD_COMMIT` niet
+  #      leeg is, en die zet alleen `bouw` er neer. `docker compose up` zet hem
+  #      nooit: de ARG staat niet in het compose-bestand.
+  #   2. `/app/server/src/services/activity.ts` is bytegelijk aan commit 96bf004a
+  #      (25-09), 96 commits achter master.
+  #   3. In de image lagen `docker-compose.yml` en de zeven `docker-compose.yml.bak-*`
+  #      van de host. Die staan niet in git en niet in de kloon; ze kunnen alleen in
+  #      een image die met de HOST-map als build-context is gebouwd.
+  #
+  # Drieën samen: de image is niet door `bouw` gemaakt. `docker compose up -d` zag
+  # een `image:`-regel plus een `build:`-blok, en omdat de getagde image niet lokaal
+  # bestond, bouwde compose ZELF uit `build.context` — de host-map, 96 commits
+  # achter master, zonder commit-stamp. Dat is de hele storing, en het is geen
+  # eigenschap van de fix maar van de rit.
+  #
+  # Twee afspraken maken dat onmogelijk, en ze moeten allebei:
+  #   a) `--no-build` op elke `up -d`, zodat compose nooit zelf een image bouwt;
+  #   b) de image moet lokaal bestaan, anders stopt het hier vóór de bevestiging.
+  # Alleen (b) zou een compose zonder `build:`-blok ook dekken, maar dan bouwt een
+  # volgende rit het alsnog zelf; alleen (a) zou doorgaan op een image die er niet is.
+  docker image inspect "$IMAGE_TAG" >/dev/null 2>&1 \
+    || { rood "de image $IMAGE_TAG bestaat niet lokaal."; \
+         rood "Zonder die image zou 'docker compose up' zelf bouwen uit build.context,"; \
+         rood "en dat is de host-map in plaats van de bron. Draai eerst ./uitrol-rek471.sh bouw."; \
+         exit 1; }
+  # En de inhoud, niet alleen het etiket: een image met de juiste tag maar zonder
+  # de lateral is precies de vorm die hier al één keer is uitgerold.
+  BOUWSTAMP="$(docker run --rm --entrypoint cat "$IMAGE_TAG" /app/server/dist/build-info.json 2>/dev/null || echo '{}')"
+  case "$BOUWSTAMP" in
+    *"$COMMIT"*) groen "de image $IMAGE_TAG draagt de stamp $COMMIT" ;;
+    *) rood "de image $IMAGE_TAG noemt $COMMIT niet (stamp: $BOUWSTAMP). Stop hier."; exit 1 ;;
+  esac
+  BOUW_LATERAL="$(docker run --rm --entrypoint grep "$IMAGE_TAG" -c jsonb_each /app/server/dist/services/activity.js 2>/dev/null || echo 0)"
+  [ "${BOUW_LATERAL:-0}" -ge 1 ] \
+    || { rood "de image $IMAGE_TAG heeft geen lateral in activity.js. Stop hier."; exit 1; }
+
   kop "6. Terugval-bevestiging"
   echo "Dit herstart de container waar het hele bedrijf op draait. Controleer eerst zelf:"
   docker compose -f "$COMPOSE" images
@@ -482,7 +526,13 @@ start() {
   [ "$bevestiging" = "UITROL" ] || { rood "Niet uitgevoerd. Er is niets gewijzigd."; exit 1; }
 
   kop "7. Uitrollen"
-  docker compose -f "$COMPOSE" up -d
+  # `--no-build`, niet zonder. Zonder die vlag bouwt compose zelf een image die
+  # niet lokaal bestaat, uit `build.context` — op deze host de map /home/kevin/
+  # paperclip, en dat is niet de bron. Gemeten 2026-10-02: dat leverde een
+  # container met de code van 25-09 en zonder commit-stamp, dus de uitrol gaf
+  # groen op een image die de fix niet bevatte. De poort hierboven weigert die
+  # situatie nu vóór de bevestiging; deze vlag maakt dat de compose zelf ook weigert.
+  docker compose -f "$COMPOSE" up -d --no-build
   docker compose -f "$COMPOSE" ps
 
   kop "8. Verificatie A — draait de container deze commit?"
@@ -537,16 +587,54 @@ start() {
   done
   [ "${CODE:-000}" = "200" ] || { rood "/api/health geeft HTTP ${CODE:-000} na 24 pogingen."; exit 1; }
 
-  kop "11. Verificatie D — welke commit meldt de bezorgde instance zelf?"
-  # De container-stamp uit stap 8 bewijst wat er in de image zit. Deze stap
-  # vraagt het aan de instance die de browser praat, want dat is de commitment die
-  # telt voor een mens die de parkeerstap wil gebruiken.
+  kop "11. Verificatie D — zegt de instance die de browser praat wat terug?"
+  # Dit was een `case` op de commit, en die kon nooit groen worden.
+  # `server/src/routes/health.ts:258` zegt:
+  #
+  #     const commit = serverInfo.git.available ? serverInfo.git.fullSha : null;
+  #
+  # en `commit` komt dus uit `.git`. Een container heeft geen `.git` — die staat
+  # in `.dockerignore` — dus `serverInfo.git.available` is in elke
+  # containeriseerde uitrol `false` en `commit` is `null`. Gemeten 2026-10-02 om
+  # 13:5xZ tegen de draaiende instance: `commit: null`, en
+  # `serverInfo.git.unavailableReason: "git_unavailable"`.
+  #
+  # Die null is dus geen fout van de uitrol; het is de vorm die deze dienst in een
+  # container aanneemt. Een poort die daarop rood gaat leert niemand iets nieuws en
+  # leert vooral het vertrouwen in de poort af. De commit-claim hoort dus bij stap 8,
+  # die de container-stamp leest, en stap 9, die de bezorgde code leest.
+  #
+  # Wat hier wél hoort te slaan: de instance is gezond, en haar `processStartedAt`
+  # ligt ná het moment waarop deze rit de container herstartte. Dat is de lezing die
+  # een mens kan omzetten naar "de browser praat tegen de nieuwe container".
   HEALTH="$(curl -s --max-time 10 https://paperclip.kevinderek.com/api/health || echo '{}')"
   echo "  /api/health: $HEALTH"
   case "$HEALTH" in
-    *"${COMMIT}"*) groen "de bezorgde instance noemt $COMMIT" ;;
-    *) rood "de bezorgde instance noemt $COMMIT niet. De uitrol is niet afgerond."; exit 1 ;;
+    *'"status":"ok"'*) groen "de bezorgde instance meldt status ok" ;;
+    *) rood "de bezorgde instance meldt geen status ok. De uitrol is niet afgerond."; exit 1 ;;
   esac
+  STARTED="$(printf '%s' "$HEALTH" | sed -n 's/.*"processStartedAt":"\([^"]*\)".*/\1/p' | head -1)"
+  echo "  processStartedAt: ${STARTED:-onleesbaar}"
+  [ -n "${STARTED:-}" ] \
+    || { rood "geen processStartedAt in /api/health. Stop hier."; exit 1; }
+  # `date -d` leest een ISO-8601 met seconden. Zonder de `-d ||` zou dit een lege
+  # string zijn en `[ "" -gt 0 ]` een fout in `[`, wat `set -e` als een mislukking
+  # van de hele stap leest.
+  STARTED_EPOCH="$(date -d "$STARTED" +%s 2>/dev/null || echo 0)"
+  NU_EPOCH="$(date +%s)"
+  LEEFTIJD=$(( NU_EPOCH - STARTED_EPOCH ))
+  echo "  leeftijd van de bezorgde container: ${LEEFTIJD}s"
+  [ "${STARTED_EPOCH:-0}" -gt 0 ] \
+    || { rood "processStartedAt ($STARTED) is geen datum die deze host kan lezen. Stop hier."; exit 1; }
+  [ "${LEEFTIJD}" -ge 0 ] \
+    || { rood "processStartedAt ligt ${LEEFTIJD}s in de toekomst. De klokken verschillen; de uitrol is niet af te beoordelen."; exit 1; }
+  [ "${LEEFTIJD}" -lt 3600 ] \
+    || { rood "de bezorgde container is al ${LEEFTIJD}s oud en is dus niet deze herstart. Iets anders heeft 'm herstart."; exit 1; }
+  groen "de browser praat tegen een container uit deze rit (${LEEFTIJD}s oud)"
+  echo
+  echo "  Let op: /api/health noemt commit=null, want 'commit' komt uit .git en een"
+  echo "  container heeft geen .git. Dat is normaal in deze uitrol. De commit-claim"
+  echo "  staat in stap 8 (container-stamp) en stap 9 (bezorgde code)."
 
   groen "Uitrol afgerond. De user-facing browsercheck is een aparte taak: parkeer één taak zonder blokker vanaf de lijst en één vanaf het board, en zie de fouttoast."
 }
@@ -570,7 +658,18 @@ terugval() {
   fi
   [ -s "$COMPOSE" ] \
     || { rood "de teruggezette compose is leeg. Kijk of $BACKUP nog bestaat."; exit 1; }
-  docker compose -f "$COMPOSE" up -d
+  # Ook hier geldt de regel van stap 7: `up -d` bouwt zelf een image die er niet is,
+  # uit `build.context`. Bij een terugval is dat het gevaarlijkste moment van de
+  # hele rit — een terugval die zelf een image bouwt is geen terugval. Dus eerst
+  # de doel-image op schijf eisen, en dan `--no-build`.
+  TERUG_IMAGE="$(sed -n '/^  *'"$SERVICE"':/,/^[^ ]/p' "$COMPOSE" | sed -n 's/^ *image: *//p' | head -1)"
+  docker image inspect "${TERUG_IMAGE:-geen-lege-afbeelding}" >/dev/null 2>&1 \
+    || { rood "de terugval-image ${TERUG_IMAGE:-onleesbaar} bestaat niet lokaal."; \
+         rood "Zonder 'up -d --no-build' zou compose zelf bouwen uit build.context, en"; \
+         rood "dat is de oude code — dus dit zou geen terugval zijn maar een nieuwe uitrol."; \
+         rood "De compose staat terug op de vorige regel; draai 'docker compose images' om het etiket te zien."; \
+         exit 1; }
+  docker compose -f "$COMPOSE" up -d --no-build
   docker compose -f "$COMPOSE" ps
   groen "teruggedraaid. De container draait weer de image uit de anker."
 }

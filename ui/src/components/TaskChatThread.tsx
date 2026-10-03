@@ -1470,7 +1470,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // A scheduled retry has not started and has no log to hydrate yet.
     if (run.status === "scheduled_retry") return "ready";
     if (run.runtimeMode === "native") {
-      const hasEntries = (transcriptByRun.get(run.id)?.length ?? 0) > 0;
       // An error on a run that already has entries still belongs on its row.
       // The thread-level Retry no longer refetches logs, so a silent partial
       // transcript would leave the reader with no notice and no way to re-read.
@@ -1480,7 +1479,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // error to see, so without this the run looks "ready" with an empty
       // transcript: the thread-level bar no longer covers per-run failures, so
       // the failure would be silent and un-retryable.
-      if (logErrorsByRun?.has(run.id)) return "error";
+      //
+      // Only while the native transport still has nothing to show. Once native
+      // events arrive they are the transcript, the fallback is no longer the
+      // source, and the log hook keeps a cleared read's error around for a grace
+      // period after a successful re-read. Treating that stale error as live put
+      // an error row beside a perfectly readable transcript.
+      if (
+        logErrorsByRun?.has(run.id) &&
+        (nativeTranscriptByRun.get(run.id)?.length ?? 0) === 0
+      )
+        return "error";
       const hydrating = hydratedNativeRunIds
         ? !hydratedNativeRunIds.has(run.id)
         : nativeEventsAreInitiallyHydrating;

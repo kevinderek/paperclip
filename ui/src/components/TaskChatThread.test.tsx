@@ -517,6 +517,46 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     expect(nativeTranscriptState.retriedRunIds).toEqual(["started-run"]);
   });
 
+  // The inverse of the case above, and it is what the check must NOT do. The
+  // legacy fallback failed, then native events arrived. The log hook keeps a
+  // cleared read's error around for a grace period, so an unconditional check
+  // put an error row beside a transcript that was readable again.
+  it("drops the fallback error once native events arrive", () => {
+    if (runtimeMode !== "native") return;
+    const props = {
+      issueId: "issue-1",
+      comments: createLongThreadComments(),
+      onAdd: async () => {},
+      linkedRuns: [
+        retryRun,
+        {
+          ...retryRun,
+          runId: "started-run",
+          status: "succeeded" as const,
+          startedAt: "2026-08-25T18:00:00.000Z",
+        },
+      ],
+    };
+    hydrate("started-run");
+    // The legacy read failed...
+    transcriptState.errorsByRun.set("started-run", new Error("boom"));
+    // ...and then the native transport produced the real transcript.
+    nativeTranscriptState.transcriptByRun.set("started-run", [
+      {
+        kind: "assistant",
+        channel: "final",
+        ts: "2026-08-25T18:00:01.000Z",
+        text: "recovered output",
+      },
+    ]);
+    render(<TaskChatThread {...props} />);
+
+    expect(
+      container.querySelector('[data-testid="transcript-slot-error-started-run"]'),
+    ).toBeNull();
+    expect(container.textContent).toContain("recovered output");
+  });
+
   // A run with entries from an earlier read, whose later read failed. The
   // thread-level Retry no longer refetches logs, so without an error row this
   // reader gets a partial transcript with no notice and no way to re-read.

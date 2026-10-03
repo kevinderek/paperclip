@@ -244,14 +244,30 @@ broncontrole() {
   #  reden, en die reden bleek een ontbrekende `safe.directory` in de poort zelf.
   #  Zonder de reden was dat niet te achterhalen zonder de fout lokaal te
   #  reconstrueren. Nu staat de reden in de uitvoer die je al leest.
-  _uit="${MAP}/broncontrole-uitvoer.txt"
+  # Een `mktemp`, geen bestand in `$MAP`. Gemeten 03-10 12:54Z op de host:
+  # `broncontrole-uitvoer.txt` was van een eerdere root-run en daardoor niet
+  # overschrijfbaar vanuit een latere run van `kevin`, en de omleiding faalde met
+  #
+  #     ./uitrol-rek471.sh: line 250: …/broncontrole-uitvoer.txt: Permission denied
+  #
+  # Daardoor voerde `node` niet eens uit, gaf de mislukte omleiding een non-zero
+  # exit, en meldde de poort "Dit script roept een naam aan die geen functie is" —
+  # terwijl de groene uitvoer die erboven stond uit het **oude** bestand kwam. De
+  # poort blokkeerde dus de uitrol met een conclusie over een poort die groen was.
+  #
+  # `mktemp` kan niet botsen en is altijd schrijfbaar door wie hem maakt. De reden
+  # wordt door het script zelf afgedrukt, dus er is geen persistent bestand nodig.
+  _uit="$(mktemp "${TMPDIR:-/tmp}/uitrol-broncontrole.XXXXXX")" \
+    || { rood "geen tijdelijk bestand voor de poortuitvoer. Stop hier."; exit 1; }
   [ -f "$BRON/server/scripts/verify-functieaanroepen.mjs" ] \
-    || { rood "server/scripts/verify-functieaanroepen.mjs ontbreekt. Stop hier."; exit 1; }
+    || { rm -f "$_uit"; rood "server/scripts/verify-functieaanroepen.mjs ontbreekt. Stop hier."; exit 1; }
   if ! node "$BRON/server/scripts/verify-functieaanroepen.mjs" "$0" >"$_uit" 2>&1; then
     sed 's/^/  /' "$_uit" | head -20
+    rm -f "$_uit"
     rood "Dit script roept een naam aan die geen functie is. Zie hierboven de regelnummers;"
     exit 1
   fi
+  rm -f "$_uit"
   groen "elke functieaanroep in dit script bestaat echt"
 
   # 5. Elke lees- en terugvalstap moet los kunnen draaien. `terugval` stierf op
@@ -276,6 +292,7 @@ broncontrole() {
       || { rood "server/scripts/verify-uitrol-zelfstandig.mjs ontbreekt. Stop hier."; exit 1; }
     if ! node "$BRON/server/scripts/verify-uitrol-zelfstandig.mjs" "$0" >"$_uit" 2>&1; then
       sed 's/^/  /' "$_uit" | head -20
+      rm -f "$_uit"
       rood "een stap van dit script kan niet los draaien. De reden staat hierboven."
       exit 1
     fi
@@ -327,7 +344,18 @@ bouw() {
   #
   # De exitcode blijft kloppen: `pipefail` staat op regel 36, dus de pipeline
   # geeft de mislukking van `docker build` terug en niet die van `tee`.
+  # Het bouw-log blijft in `$MAP`, want dat is wat de gebruiker wil lezen als de
+  # bouw misgaat. Maar een log van een eerdere run met een andere uid is niet
+  # overschrijfbaar, en dat zou `bouw` op `tee` laten struikelen. Gemeten
+  # 03-10 12:47Z: `bouw-uitvoer.txt` stond als root:root 644 in een map van
+  # `kevin`. Weghalen mag vanuit de eigenaar van de map, en daarna maakt `tee`
+  # hem nieuw aan.
   BOUW_LOG="${MAP}/bouw-uitvoer.txt"
+  if [ -e "$BOUW_LOG" ] && [ ! -w "$BOUW_LOG" ]; then
+    rm -f "$BOUW_LOG" 2>/dev/null \
+      || { rood "het oude bouw-log $BOUW_LOG is niet overschrijfbaar en niet te verwijderen."; \
+           rood "Verwijder het zelf en draai opnieuw, of kies een andere map met MAP."; exit 1; }
+  fi
   docker build \
     --build-arg "PAPERCLIP_BUILD_COMMIT=$COMMIT" \
     -t "$IMAGE_TAG" \

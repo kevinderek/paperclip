@@ -319,11 +319,21 @@ bouw() {
   controleer
   schrijf_anker
   kop "4. Image bouwen (enkele minuten; dit bouwt de rust-toolchain mee)"
+  # `| tee` zodat een mislukte build achteraf te lezen is. Gemeten 2026-10-03
+  # 00:24:10Z: de keten kwam op de host door alle bronpoorten en schreef het
+  # terugvalanker, en daarna was er geen compose-backup meer en was de container
+  # nog niet herstart. Er stond geen log om te lezen waarom de build ophield —
+  # de uitvoer van `docker build` ging naar het scherm en was daarna weg.
+  #
+  # De exitcode blijft kloppen: `pipefail` staat op regel 36, dus de pipeline
+  # geeft de mislukking van `docker build` terug en niet die van `tee`.
+  BOUW_LOG="${MAP}/bouw-uitvoer.txt"
   docker build \
     --build-arg "PAPERCLIP_BUILD_COMMIT=$COMMIT" \
     -t "$IMAGE_TAG" \
     -f "$BRON/Dockerfile" \
-    "$BRON"
+    "$BRON" 2>&1 | tee "$BOUW_LOG"
+  echo "  build-log         : $BOUW_LOG"
   groen "gebouwd: $IMAGE_TAG"
   kop "4b. Zit de commit-stamp erin? (zonder deze stap is 'live' achteraf niet te controleren)"
   STAMP="$(docker run --rm --entrypoint cat "$IMAGE_TAG" /app/server/dist/build-info.json 2>/dev/null || echo '{}')"

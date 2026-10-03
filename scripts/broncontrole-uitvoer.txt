@@ -3,13 +3,13 @@ functies      : 12 — alles, bouw, broncontrole, config, controleer, koppel, ra
 aanroepen     : 16
 dispatch-regels: 8
 
-  ok       inspect    -> controleer   (regel 836)
-  ok       bouw       -> bouw         (regel 837)
-  ok       koppel     -> koppel       (regel 838)
-  ok       start      -> start        (regel 839)
-  ok       terugval   -> terugval     (regel 840)
-  ok       config     -> config       (regel 841)
-  ok       rapport    -> rapport      (regel 842)
-  ok       alles      -> alles        (regel 843)
+  ok       inspect    -> controleer   (regel 846)
+  ok       bouw       -> bouw         (regel 847)
+  ok       koppel     -> koppel       (regel 848)
+  ok       start      -> start        (regel 849)
+  ok       terugval   -> terugval     (regel 850)
+  ok       config     -> config       (regel 851)
+  ok       rapport    -> rapport      (regel 852)
+  ok       alles      -> alles        (regel 853)
 
 GROEN: elke aanroep heeft een functie

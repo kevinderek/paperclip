@@ -583,9 +583,32 @@ start() {
     *"$COMMIT"*) groen "de image $IMAGE_TAG draagt de stamp $COMMIT" ;;
     *) rood "de image $IMAGE_TAG noemt $COMMIT niet (stamp: $BOUWSTAMP). Stop hier."; exit 1 ;;
   esac
-  BOUW_LATERAL="$(docker run --rm --entrypoint grep "$IMAGE_TAG" -c jsonb_each /app/server/dist/services/activity.js 2>/dev/null || echo 0)"
+  # De lateral staat in `jsonb-detoast.ts`, dus in `jsonb-detoast.js` — niet in
+  # `activity.js`. Gemeten 2026-10-03 15:57Z op de host:
+  #
+  #     de image paperclip-rek471:eb1030b56dc7 draagt de stamp eb1030b…
+  #     ./uitrol-rek471.sh: line 587: [: 00: integer expected
+  #     de image paperclip-rek471:eb1030b56dc7 heeft geen lateral in activity.js.
+  #
+  # Twee fouten in één regel. De eerste: het verkeerde bestand. `grep -rn 'from
+  # jsonb_each(' server/src` geeft precies één treffer, in
+  # `server/src/services/jsonb-detoast.ts`; `activity.ts` heeft er nul.
+  # `execution-projection.ts` importeert de helper, dus zijn dist bevat de string
+  # ook niet.
+  #
+  # De tweede: `grep -c` geeft exit 1 als er nul treffers zijn, dus `|| echo 0`
+  # plakt een tweede 0. De waarde wordt "0\n0", en `[ "0\n0" -ge 1 ]` zegt
+  # `integer expected` — waarna de `||`-tak alsnog vuurt en de fout meldt.
+  #
+  # Beide zijn het gevolg van testen met een nep-docker die altijd een getal
+  # teruggaf: die gaf ook "3" voor een bestand waarvan de echte inhoud "0" is.
+  # `$latentie` hieronder maakt van alles wat geen cijfer is een "0", zodat de
+  # poort bij nul treffers óók rood gaat, maar met de juiste reden.
+  BOUW_LATERAL="$(docker run --rm --entrypoint grep "$IMAGE_TAG" -c 'from jsonb_each(' /app/server/dist/services/jsonb-detoast.js 2>/dev/null || true)"
+  BOUW_LATERAL="${BOUW_LATERAL//[^0-9]/}"
   [ "${BOUW_LATERAL:-0}" -ge 1 ] \
-    || { rood "de image $IMAGE_TAG heeft geen lateral in activity.js. Stop hier."; exit 1; }
+    || { rood "de image $IMAGE_TAG heeft geen lateral in jsonb-detoast.js. Stop hier."; exit 1; }
+  groen "de image bevat de lateral (${BOUW_LATERAL} treffer(s) in jsonb-detoast.js)"
 
   kop "6. Terugval-bevestiging"
   echo "Dit herstart de container waar het hele bedrijf op draait. Controleer eerst zelf:"
@@ -631,15 +654,14 @@ start() {
   # Beide op nul meten betekent "deze afleiding draait nog op de oude code".
   CTR="$(docker ps --filter "label=com.docker.compose.service=$SERVICE" --format '{{.ID}}' | head -1)"
   [ -n "$CTR" ] || { rood "geen draaiende container voor service '$SERVICE'. Stop hier."; exit 1; }
-  DIST_ACT="$(docker exec "$CTR" sh -c "grep -c 'jsonb_each' /app/server/dist/services/activity.js 2>/dev/null || echo 0")"
-  DIST_EXEC="$(docker exec "$CTR" sh -c "grep -c 'jsonb_each' /app/server/dist/services/execution-projection.js 2>/dev/null || echo 0")"
-  DIST_EXISTS="$(docker exec "$CTR" sh -c "grep -c 'exists (' /app/server/dist/services/activity.js 2>/dev/null || echo 0")"
-  echo "  activity.js: jsonb_each=$DIST_ACT, 'exists ('=$DIST_EXISTS"
-  echo "  execution-projection.js: jsonb_each=$DIST_EXEC"
-  [ "${DIST_ACT:-0}" -ge 1 ] \
-    || { rood "De lateral (jsonb_each) ontbreekt in de bezorgde activity.js. De UI is dus niet bij."; exit 1; }
-  [ "${DIST_EXEC:-0}" -ge 1 ] \
-    || { rood "De lateral ontbreekt in de bezorgde execution-projection.js. Stop hier."; exit 1; }
+  DIST_LATERAL="$(docker exec "$CTR" sh -c "grep -c 'from jsonb_each(' /app/server/dist/services/jsonb-detoast.js 2>/dev/null || true")"
+  DIST_LATERAL="${DIST_LATERAL//[^0-9]/}"
+  DIST_EXISTS="$(docker exec "$CTR" sh -c "grep -c 'exists (' /app/server/dist/services/activity.js 2>/dev/null || true")"
+  DIST_EXISTS="${DIST_EXISTS//[^0-9]/}"
+  echo "  jsonb-detoast.js: from jsonb_each= $DIST_LATERAL"
+  echo "  activity.js: 'exists ('=$DIST_EXISTS"
+  [ "${DIST_LATERAL:-0}" -ge 1 ] \
+    || { rood "De lateral (from jsonb_each) ontbreekt in de bezorgde jsonb-detoast.js. Stop hier."; exit 1; }
   [ "${DIST_EXISTS:-0}" = "1" ] \
     || { rood "De bezorgde activity.js heeft $DIST_EXISTS treffers op 'exists ('; verwacht 1. De oude OR-vorm draait nog."; exit 1; }
   groen "de bezorgde code is de nieuwe: lateral aanwezig, OR-vorm weg"

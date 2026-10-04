@@ -71,6 +71,7 @@ import {
   plugins,
   projects,
   projectWorkspaces,
+  routines,
   statusDecisionEffects,
   statusDecisions,
   toolApplications,
@@ -618,6 +619,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // attempt so a late insert cannot hold the agents foreign key.
       await db.delete(agentWakeupRequests);
       await db.delete(agentRuntimeState);
+      // `routines.assignee_agent_id` references agents, so routine fixtures
+      // have to go before the agent row or the delete is refused.
+      await db.delete(routines);
       try {
         await db.delete(agents);
         break;
@@ -917,6 +921,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runError?: string | null;
     resultJson?: Record<string, unknown> | null;
     monitorNextCheckAt?: Date | null;
+    /**
+     * See `seedQueuedIssueRunFixture`: `carrier: true` shapes the issue as the
+     * execution carrier of a routine (routine in `originId`,
+     * `originKind: "routine_execution"`, no `parentId`). Without `carrier` the
+     * routine exists but does not own the issue, which is the negative control.
+     */
+    routine?: {
+      status?: "active" | "paused" | "archived";
+      carrier?: boolean;
+    };
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -924,6 +938,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const wakeupRequestId = randomUUID();
     const rootIssueId = randomUUID();
     const issueId = randomUUID();
+    const routineId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
@@ -1042,8 +1057,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         issueNumber: input.activePauseHold ? 2 : 1,
         identifier: `${issuePrefix}-${input.activePauseHold ? 2 : 1}`,
         startedAt: input.status === "in_progress" ? now : null,
+        ...(input.routine?.carrier
+          ? { parentId: null, originKind: "routine_execution", originId: routineId }
+          : {}),
       },
     ]);
+
+    if (input.routine) {
+      await db.insert(routines).values({
+        id: routineId,
+        companyId,
+        title: "Nachtelijke controle",
+        assigneeAgentId: agentId,
+        status: input.routine.status ?? "active",
+        responsibleUserId: "responsible-user",
+      });
+    }
 
     if (input.activePauseHold) {
       await db.insert(issueTreeHolds).values({
@@ -1056,8 +1085,89 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
     }
 
-    return { companyId, agentId, runId, wakeupRequestId, issueId, rootIssueId };
+    return { companyId, agentId, runId, wakeupRequestId, issueId, rootIssueId, routineId };
   }
+
+  // The stranded sweep is the second lane that spends a full agent run on an
+  // `in_progress` carrier: it treats a productive ended run as stranded work and
+  // requeues `issue.productive_terminal_continuation_recovery`. Without this
+  // gate, skipping the finish-handoff wake for carriers only moved the cost to
+  // the next sweep instead of removing it (REK-526).
+  it("leaves an in_progress routine execution carrier to its routine in the stranded sweep", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      routine: { carrier: true },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.dispositionRepairRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(runId);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  // Negative control: same fixture, same productive ended run, but the issue is
+  // not a carrier. The sweep must still requeue its continuation.
+  it("still requeues the continuation for an in_progress issue that is not a routine carrier", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      routine: { carrier: false },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+    const continuation = runs.find((row) => row.id !== runId);
+    expect(continuation?.contextSnapshot).toMatchObject({ issueId });
+  });
+
+  // A paused routine fires no more carriers, so it owns nothing: the carrier
+  // must fall back to the generic continuation instead of lingering unowned.
+  it("still requeues the continuation for a carrier whose routine is no longer active", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      routine: { carrier: true, status: "paused" },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(1);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+    const continuation = runs.find((row) => row.id !== runId);
+    expect(continuation?.contextSnapshot).toMatchObject({ issueId });
+  });
 
   async function bindChatConversation(input: {
     agentId: string;
@@ -1402,12 +1512,30 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
-  async function seedQueuedIssueRunFixture() {
+  async function seedQueuedIssueRunFixture(input?: {
+    /**
+     * Seed an active/paused routine in the same company.
+     *
+     * `carrier: true` additionally shapes the seeded issue as the execution
+     * carrier that routine creates when it fires: the routine lives in
+     * `originId`, `originKind` is `routine_execution`, and the issue has no
+     * `parentId` of its own. That is the shape that fell through every
+     * `routines.parentIssueId = issue.id` check, because a carrier's `parentId`
+     * is the routine's parent, never the carrier id. Without `carrier` the issue
+     * stays ordinary, which is the negative control: an active routine in the
+     * company must not exempt an issue it does not own.
+     */
+    routine?: {
+      status?: "active" | "paused" | "archived";
+      carrier?: boolean;
+    };
+  }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
     const wakeupRequestId = randomUUID();
     const issueId = randomUUID();
+    const routineId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
@@ -1467,6 +1595,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       createdAt: now,
     });
 
+    if (input?.routine) {
+      await db.insert(routines).values({
+        id: routineId,
+        companyId,
+        title: "Nachtelijke controle",
+        assigneeAgentId: agentId,
+        status: input.routine.status ?? "active",
+        responsibleUserId: "responsible-user",
+      });
+    }
+
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -1482,9 +1621,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
       startedAt: now,
+      ...(input?.routine?.carrier
+        ? { parentId: null, originKind: "routine_execution", originId: routineId }
+        : {}),
     });
 
-    return { companyId, agentId, runId, wakeupRequestId, issueId };
+    return { companyId, agentId, runId, wakeupRequestId, issueId, routineId };
   }
 
   it("persists the normalized failure without permanently blocking the conversation", async () => {
@@ -5498,6 +5640,160 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).not.toEqual(expect.arrayContaining([expect.objectContaining({body: SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY})]));
     expect(repairs[0].idempotencyKey).toBe(`issue_disposition_repair:${issueId}:${legacyDispositionFingerprint(companyId, issueId, agentId, runId)}:1`);
+  });
+
+  // Regression, carrier form (REK-526). A routine execution carrier keeps its
+  // routine in `originId` and has no `parentIssueId`, so the
+  // `routines.parentIssueId = issue.id` continuation check can never match one:
+  // the "active routine continuation owns the next action" skip was unreachable
+  // for every carrier, and a routine run that left its carrier `in_progress`
+  // paid a full corrective agent run per attempt until the attempt cap escalated
+  // it to `blocked`.
+  it("does not queue a finish-handoff wake for a routine execution carrier left in progress", async () => {
+    const { companyId, agentId, issueId } = await seedQueuedIssueRunFixture({
+      routine: { carrier: true },
+    });
+    mockAdapterExecute.mockImplementationOnce(
+      async (ctx: { runId: string }) => {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: ctx.runId,
+          body: "Routine ran; no relevant changes found.",
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Routine ran; no relevant changes found.",
+          provider: "test",
+          model: "test-model",
+        };
+      },
+    );
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((w) => w.reason === "finish_successful_run_handoff")).toHaveLength(0);
+    expect(wakes.filter((w) => w.reason === "issue_disposition_repair")).toHaveLength(0);
+    // One run, not two: the corrective run is the cost this removes.
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    expect(
+      await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, issueId),
+            eq(activityLog.action, "issue.successful_run_handoff_required"),
+          ),
+        ),
+    ).toHaveLength(0);
+    expect(
+      await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId)),
+    ).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ body: SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY }),
+      ]),
+    );
+  });
+
+  // Negative control for the case above: an active routine exists in the same
+  // company, but this ordinary issue is not its carrier and the routine does not
+  // point at it. A carrier-shaped predicate that was too wide would silence the
+  // corrective wake here too, which is the leak this test exists to prevent.
+  it("still queues a corrective wake for an ordinary issue that is not a routine carrier", async () => {
+    const { companyId, agentId, issueId } = await seedQueuedIssueRunFixture({
+      routine: { carrier: false },
+    });
+    mockAdapterExecute.mockImplementationOnce(
+      async (ctx: { runId: string }) => {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: ctx.runId,
+          body: "Implemented the fix but did not choose a final issue state.",
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Implemented the fix but did not choose a final issue state.",
+          provider: "test",
+          model: "test-model",
+        };
+      },
+    );
+    // The corrective agent records completion through state, not its final text.
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, summary: "Nothing left to do.", provider: "test", model: "test-model" };
+    });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((w) => w.reason === "issue_disposition_repair")).toHaveLength(1);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+  });
+
+  // A routine that no longer fires owns nothing: its carrier must keep the
+  // generic correction, otherwise a paused routine would strand every carrier it
+  // ever created with no path back to a disposition.
+  it("still queues a corrective wake for a carrier whose routine is no longer active", async () => {
+    const { companyId, agentId, issueId } = await seedQueuedIssueRunFixture({
+      routine: { carrier: true, status: "paused" },
+    });
+    mockAdapterExecute.mockImplementationOnce(
+      async (ctx: { runId: string }) => {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: ctx.runId,
+          body: "Routine ran; no relevant changes found.",
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Routine ran; no relevant changes found.",
+          provider: "test",
+          model: "test-model",
+        };
+      },
+    );
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, summary: "Carrier closed.", provider: "test", model: "test-model" };
+    });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((w) => w.reason === "issue_disposition_repair")).toHaveLength(1);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {

@@ -59,6 +59,7 @@ export {
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  routineExecutionCarrierRoutineId,
 } from "./successful-run-handoff.js";
 export type {
   SuccessfulRunHandoffNotice,

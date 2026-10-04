@@ -509,6 +509,7 @@ import {
   isSuccessfulRunHandoffValidPathSkip,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
+  routineExecutionCarrierRoutineId,
 } from "./recovery/index.js";
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
@@ -13370,6 +13371,7 @@ export function heartbeatService(
         monitorNextCheckAt: issues.monitorNextCheckAt,
         projectId: issues.projectId,
         originKind: issues.originKind,
+        originId: issues.originId,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -13399,6 +13401,17 @@ export function heartbeatService(
       readNonEmptyString(run.nextAction),
       currentUserRedactionOptions,
     );
+
+    // Two shapes make an active routine own this issue's next action, and the
+    // first one alone is blind to every routine-carrier this platform creates:
+    // the recurring parent of a routine (`routines.parentIssueId = issue.id`),
+    // and the routine execution carrier itself, which keeps the routine in
+    // `originId` and has no `parentIssueId` of its own. Without the second
+    // shape the "active routine continuation owns the next action" skip is
+    // unreachable for a carrier, so a routine run that leaves its carrier
+    // `in_progress` is charged a corrective handoff wake on every attempt until
+    // the attempt cap escalates it to `blocked`.
+    const carrierRoutineId = routineExecutionCarrierRoutineId(issue);
 
     const [
       activeExecutionPath,
@@ -13549,8 +13562,11 @@ export function heartbeatService(
             .where(
               and(
                 eq(routines.companyId, issue.companyId),
-                eq(routines.parentIssueId, issue.id),
                 eq(routines.status, "active"),
+                or(
+                  eq(routines.parentIssueId, issue.id),
+                  ...(carrierRoutineId ? [eq(routines.id, carrierRoutineId)] : []),
+                ),
               ),
             )
             .limit(1)

@@ -70,6 +70,36 @@ export function isPluginManagedIssueLifecycle(issue: { originKind?: string | nul
   return Boolean(issue.originKind?.startsWith("plugin:"));
 }
 
+/**
+ * A routine execution carrier is the issue a routine creates when it fires. It
+ * keeps the routine in `originId` and has no `parentIssueId` of its own: the
+ * carrier's `parentId` is the *routine's* parent issue, never the carrier id. So
+ * the "this issue is the recurring parent of an active routine" shape
+ * (`routines.parentIssueId = issue.id`) can never match a carrier, and every
+ * check written in that shape is blind to the one form a routine actually
+ * produces.
+ *
+ * Returns the id of the routine whose continued firing owns this issue's
+ * disposition, or null when the issue is not a carrier. The routine id is only
+ * meaningful together with a `routines.status = 'active'` check: a paused
+ * routine will not fire again, so nothing owns the carrier and generic recovery
+ * must still be able to escalate it.
+ *
+ * Deliberately narrow. It does not fire for an issue that merely has a routine
+ * pointing at it (that is the `parentIssueId` branch, which stays separate), and
+ * a plugin-managed routine execution carries a `plugin:` originKind instead of
+ * `routine_execution`, so it keeps its own lifecycle via
+ * `isPluginManagedIssueLifecycle`.
+ */
+export function routineExecutionCarrierRoutineId(issue: {
+  originKind?: string | null;
+  originId?: string | null;
+} | null): string | null {
+  if (!issue || issue.originKind !== "routine_execution") return null;
+  const originId = typeof issue.originId === "string" ? issue.originId.trim() : "";
+  return originId || null;
+}
+
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,

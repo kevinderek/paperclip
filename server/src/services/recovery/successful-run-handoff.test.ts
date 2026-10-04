@@ -14,6 +14,7 @@ import {
   isPluginManagedIssueLifecycle,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  routineExecutionCarrierRoutineId,
 } from "./successful-run-handoff.js";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 
@@ -602,6 +603,47 @@ describe("successful run handoff decision", () => {
     ]));
     expect(noticeMetadataReferencesRecoveryAction(notice.metadata, "77777777-7777-4777-8777-777777777777")).toBe(true);
     expect(noticeMetadataReferencesRecoveryAction(notice.metadata, "88888888-8888-4888-8888-888888888888")).toBe(false);
+  });
+
+  it("recognizes only a routine execution carrier as a carrier, and only with a routine id", () => {
+    // The carrier shape a routine produces when it fires: routine in `originId`,
+    // `originKind: "routine_execution"`, and no `parentIssueId` at all.
+    expect(
+      routineExecutionCarrierRoutineId({
+        originKind: "routine_execution",
+        originId: "44444444-4444-4444-8444-444444444444",
+      }),
+    ).toBe("44444444-4444-4444-8444-444444444444");
+
+    // Every other origin kind is somebody else's lifecycle, and an issue that
+    // merely has a routine pointing at it (the recurring-parent form) must keep
+    // its own disposition.
+    expect(
+      routineExecutionCarrierRoutineId({
+        originKind: "plugin:workflow",
+        originId: "44444444-4444-4444-8444-444444444444",
+      }),
+    ).toBeNull();
+    expect(
+      routineExecutionCarrierRoutineId({
+        originKind: "stranded_issue_recovery",
+        originId: "44444444-4444-4444-8444-444444444444",
+      }),
+    ).toBeNull();
+    expect(routineExecutionCarrierRoutineId({ originKind: null, originId: null })).toBeNull();
+    expect(
+      routineExecutionCarrierRoutineId({
+        originKind: "routine_execution",
+        originId: null,
+      }),
+    ).toBeNull();
+    expect(
+      routineExecutionCarrierRoutineId({
+        originKind: "routine_execution",
+        originId: "   ",
+      }),
+    ).toBeNull();
+    expect(routineExecutionCarrierRoutineId(null)).toBeNull();
   });
 
   it("recognizes new notices and legacy markdown headings for fallback deduplication", () => {

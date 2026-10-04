@@ -1477,6 +1477,7 @@ function projectIssueWakeRequest(
     agentId: options.includeInternalIds ? row.agentId : null,
     source: projectWakeDiagnosticSource(row.source) ?? "other",
     reason: projectWakeDiagnosticReason(row.reason),
+    requestedReason: row.reason,
     status,
     coalescedCount: row.coalescedCount,
     runId: options.includeInternalIds ? row.runId : null,

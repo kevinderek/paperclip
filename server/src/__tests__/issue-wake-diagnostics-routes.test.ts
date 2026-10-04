@@ -267,6 +267,52 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(serialized).not.toContain("\"error\"");
   });
 
+  it("keeps the gate reason readable when the known-reason allowlist collapses it to other", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      title: "Silently dropped assignment",
+      status: "todo",
+      assigneeAgentId: agent.id,
+    });
+
+    // REK-552: an assignment wake that a gate killed before any run existed.
+    // The gate overwrites `reason` on the same row, so `reason` alone can no
+    // longer say which gate did it. This is the row shape the board saw as
+    // `source: assignment, reason: other, status: skipped, runId: null`.
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "assignment",
+      reason: "agent.not_invokable",
+      status: "skipped",
+      error: "Agent is not invokable in its current state",
+      payload: { issueId: issue.id, rawMarker: "SHOULD_NOT_LEAK" },
+      requestedAt: new Date(Date.now() - 5_000),
+      finishedAt: new Date(Date.now() - 4_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      source: "assignment",
+      reason: "other",
+      requestedReason: "agent.not_invokable",
+      status: "skipped",
+      runId: null,
+      failureClass: "failed",
+    });
+    // The raw reason is a gate code, never payload prose: the payload and the
+    // human-readable `error` stay out of this broadly-readable projection.
+    expect(JSON.stringify(res.body)).not.toContain("SHOULD_NOT_LEAK");
+    expect(JSON.stringify(res.body)).not.toContain("\"error\"");
+  });
+
   it.each(["chat_task_completed", "issue_execution_deferred"])("preserves the known %s reason without exposing completion payloads", async reason => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);

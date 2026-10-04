@@ -145,6 +145,83 @@ export function dispositionRepairEscalationRepeatsStandingNotice(input: {
   return evidence.terminalReason === input.terminalReason;
 }
 
+/**
+ * How long one issue stays quiet per terminal reason after the board was told.
+ *
+ * Same order of magnitude as the provider-quota backoff
+ * (`PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS`, one hour): that lane already
+ * treats an hour as the shortest honest interval before repeating itself to a
+ * human.
+ */
+export const DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS = 60 * 60 * 1000;
+
+/**
+ * How many recovery-action records of one issue are inspected for an earlier
+ * notice. Newest first, so a limit truncates the oldest history first.
+ */
+export const DISPOSITION_REPAIR_NOTICE_LOOKBACK = 50;
+
+function readEvidenceRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function readEvidenceTimestampMs(value: unknown): number | null {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? null : ms;
+  }
+  return null;
+}
+
+/**
+ * Whether this escalation would repeat a board notice that is still fresh.
+ *
+ * {@link dispositionRepairEscalationRepeatsStandingNotice} only sees a *standing*
+ * board escalation. Anything that takes the source issue off `blocked` clears
+ * `active` on purpose — a handback, and above all the `source_revalidation`
+ * cancel ("stale because the source issue was manually moved from blocked to
+ * todo") — and the next sweep then starts a fresh episode with a fresh notice.
+ * Measured 2026-10-04 over 12h: of 12 `issue.disposition_repair_escalated` rows
+ * in a 3h13m window, 5 repeats followed exactly such a clear, the shortest 42 s
+ * after the board itself moved the issue back to `todo`. Those repeats carry no
+ * new information — the board just decided to retry the same failing agent — so
+ * the escalation still happens (the issue is blocked, the action is board-owned
+ * and resolvable) but the notice is withheld until the window elapses.
+ *
+ * Silence is bounded: after the cooldown the next escalation notifies again, and
+ * a different terminal reason always notifies immediately.
+ */
+export function dispositionRepairEscalationRepeatsRecentNotice(input: {
+  priorEvidences: readonly unknown[];
+  terminalReason: string;
+  now: Date;
+  cooldownMs?: number;
+}) {
+  const cooldownMs = Math.max(
+    0,
+    input.cooldownMs ?? DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS,
+  );
+  if (cooldownMs === 0) return false;
+  const nowMs = input.now.getTime();
+  return input.priorEvidences.some((candidate) => {
+    const evidence = readEvidenceRecord(candidate);
+    if (evidence.terminalReason !== input.terminalReason) return false;
+    const escalatedAtMs = readEvidenceTimestampMs(evidence.escalatedAt);
+    if (escalatedAtMs === null) return false;
+    const ageMs = nowMs - escalatedAtMs;
+    // A future timestamp is not evidence of a notice; ignore it rather than
+    // suppressing forever.
+    return ageMs >= 0 && ageMs < cooldownMs;
+  });
+}
+
 export async function collectDispositionRepairSourceState(
   db: Db,
   input: {

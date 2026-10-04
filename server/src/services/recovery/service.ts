@@ -142,9 +142,12 @@ import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js"
 import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
+  dispositionRepairEscalationRepeatsRecentNotice,
   dispositionRepairEscalationRepeatsStandingNotice,
   dispositionRepairMaxAttemptsForRun,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
+  DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS,
+  DISPOSITION_REPAIR_NOTICE_LOOKBACK,
 } from "./disposition-repair.js";
 import {
   createActiveRunWatchdog,
@@ -3632,6 +3635,40 @@ export function recoveryService(
     return result;
   }
 
+  /**
+   * Evidence of the escalations this issue has already drawn, newest record
+   * first. A notice has to outlive the action record that carried it: a handback
+   * or a `source_revalidation` cancel clears `active`, so the standing-notice
+   * guard in {@link escalateDispositionRepair} cannot see it any more.
+   *
+   * `updatedAt >= now - cooldown` is a sound bound for the rows that can still
+   * matter: a record is stamped with `now` when it is escalated, and only moved
+   * forward afterwards, so an `escalatedAt` inside the window always sits on a
+   * row inside this bound. Rows inside the bound that escalated earlier are
+   * filtered on the real timestamp afterwards.
+   */
+  async function listDispositionRepairEscalationEvidences(
+    companyId: string,
+    issueId: string,
+    now: Date,
+  ) {
+    const since = new Date(now.getTime() - DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS);
+    const rows = await db
+      .select({ evidence: issueRecoveryActions.evidence })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+          eq(issueRecoveryActions.kind, "deliberate_wait_without_target"),
+          gte(issueRecoveryActions.updatedAt, since),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt))
+      .limit(DISPOSITION_REPAIR_NOTICE_LOOKBACK);
+    return rows.map((row) => row.evidence);
+  }
+
   async function escalateDispositionRepair(input: {
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
@@ -3672,6 +3709,23 @@ export function recoveryService(
       return null;
     }
     const now = new Date();
+    // A clear of `active` is not the end of the notice. Measured 2026-10-04 over
+    // 12h, 5 of 12 board notices in a 3h13m window were repeats that followed a
+    // handback or a `source_revalidation` cancel within 42 s to 37 min — the board
+    // had just decided to retry the same failing agent and was told about it again
+    // a minute later. The escalation below still happens (blocked, board-owned,
+    // resolvable); only the notice is withheld, and only for
+    // DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS per terminal reason.
+    const priorEvidences = await listDispositionRepairEscalationEvidences(
+      input.issue.companyId,
+      input.issue.id,
+      now,
+    );
+    const noticeSuppressed = dispositionRepairEscalationRepeatsRecentNotice({
+      priorEvidences,
+      terminalReason: input.terminalReason,
+      now,
+    });
     await db
       .update(issueRecoveryActions)
       .set({
@@ -3691,6 +3745,11 @@ export function recoveryService(
           sourceStateFingerprint: sourceStateFingerprint,
           episodeFingerprint: input.fingerprint,
           terminalReason: input.terminalReason,
+          // When this issue was last told about this terminal reason. Read back by
+          // the notice cooldown, which has to outlive the action record itself: a
+          // handback or a `source_revalidation` cancel clears `active`, and the next
+          // sweep would otherwise re-notify the board about the same stall.
+          escalatedAt: now.toISOString(),
           sourceAttemptCount: input.attemptCount,
           sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
           routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
@@ -3721,43 +3780,45 @@ export function recoveryService(
       updated.assigneeAgentId === input.issue.assigneeAgentId &&
       updated.assigneeUserId === input.issue.assigneeUserId;
 
-    await issuesSvc.addComment(
-      input.issue.id,
-      [
-        "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
-        "",
-        `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
-        `- Terminal reason: \`${input.terminalReason}\``,
-        "- Recovery owner: board",
-        "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
-        "",
-        "Next action: repair the liveness disposition or request an explicit source-owner decision.",
-      ].join("\n"),
-      {},
-      {
-        authorType: "system",
-        presentation: compactRecoveryPresentation(
-          "Agent needs attention",
-        ),
-        metadata: {
-          ...recoveryNoticeMetadata({
-            cause: "deliberate_wait_without_target",
-            latestRun: input.latestRun,
-            recoveryActionId: action.id,
-            previousStatus: input.issue.status,
-            recoveryOwner: null,
-          }),
-          recovery: {
-            kind: "disposition_repair_escalated",
-            actionId: action.id,
-            attemptCount: input.attemptCount,
-            maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-            reason: input.terminalReason,
-            assigneeAgentId: input.issue.assigneeAgentId,
+    if (!noticeSuppressed) {
+      await issuesSvc.addComment(
+        input.issue.id,
+        [
+          "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
+          "",
+          `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
+          `- Terminal reason: \`${input.terminalReason}\``,
+          "- Recovery owner: board",
+          "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
+          "",
+          "Next action: repair the liveness disposition or request an explicit source-owner decision.",
+        ].join("\n"),
+        {},
+        {
+          authorType: "system",
+          presentation: compactRecoveryPresentation(
+            "Agent needs attention",
+          ),
+          metadata: {
+            ...recoveryNoticeMetadata({
+              cause: "deliberate_wait_without_target",
+              latestRun: input.latestRun,
+              recoveryActionId: action.id,
+              previousStatus: input.issue.status,
+              recoveryOwner: null,
+            }),
+            recovery: {
+              kind: "disposition_repair_escalated",
+              actionId: action.id,
+              attemptCount: input.attemptCount,
+              maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+              reason: input.terminalReason,
+              assigneeAgentId: input.issue.assigneeAgentId,
+            },
           },
         },
-      },
-    );
+      );
+    }
 
     await logActivity(db, {
       companyId: input.issue.companyId,
@@ -3781,6 +3842,11 @@ export function recoveryService(
         recoveryOwnerAgentId: null,
         recoveryOwnerType: "board",
         routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
+        // The escalation happened; the board notice did not, because a notice for
+        // this exact terminal reason on this issue is younger than
+        // DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS. Logged, not silent.
+        noticeSuppressed,
+        escalatedAt: now.toISOString(),
         sourceAssigneeBefore: {
           agentId: input.issue.assigneeAgentId,
           userId: input.issue.assigneeUserId,

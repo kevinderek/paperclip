@@ -5,8 +5,10 @@ import {
   DISPOSITION_REPAIR_BASE_DELAYS_MS,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
   dispositionRepairDelayMs,
+  dispositionRepairEscalationRepeatsRecentNotice,
   dispositionRepairEscalationRepeatsStandingNotice,
   dispositionRepairMaxAttemptsForRun,
+  DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS,
 } from "../services/recovery/disposition-repair.ts";
 import { LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS } from "../services/recovery/legacy-continuation.ts";
 
@@ -208,5 +210,199 @@ describe("a succeeded run is measured against the regular spine, not the legacy 
     expect(
       dispositionRepairMaxAttemptsForRun({ legacyMaxAttempts: null, runSucceeded: false }),
     ).toBe(LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS);
+  });
+});
+
+describe("a cleared escalation does not re-notify the board inside the cooldown", () => {
+  const MEASURED_REASON = "unchanged_source_state_exhausted";
+
+  // Measured 2026-10-04 from `issue.disposition_repair_escalated` and
+  // `issue.recovery_action_resolved` rows. REK-416: notice 09:45:07.419Z, the
+  // board moved the source issue blocked -> todo at 09:47:32.191Z, which
+  // cancelled the action as `source_revalidation` ("stale because the source
+  // issue was manually moved from blocked to todo"), and the next sweep
+  // escalated again at 09:48:14.245Z — 2m07s after the notice, 42s after the
+  // board's own move. Nothing about the failing agent changed in between.
+  const rek416Notice = "2026-10-04T09:45:07.419Z";
+  const rek416Repeat = "2026-10-04T09:48:14.245Z";
+
+  it("suppresses the notice when the action record was cleared after the notice", () => {
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          {
+            terminalReason: MEASURED_REASON,
+            sourceStateFingerprint: MEASURED_SOURCE_STATE_FINGERPRINT,
+            escalatedAt: rek416Notice,
+          },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date(rek416Repeat),
+      }),
+    ).toBe(true);
+  });
+
+  it("counts the age from the notice, not from the clear that followed it", () => {
+    // The same record cancelled 40 minutes after the notice is still inside the
+    // hour, and a record cancelled 61 minutes after it is not. The edge itself
+    // belongs to the next window: an hour-old notice is exactly old enough.
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          { terminalReason: MEASURED_REASON, escalatedAt: rek416Notice },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date("2026-10-04T10:44:07.419Z"),
+      }),
+    ).toBe(true);
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          { terminalReason: MEASURED_REASON, escalatedAt: rek416Notice },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date("2026-10-04T10:45:07.419Z"),
+      }),
+    ).toBe(false);
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          { terminalReason: MEASURED_REASON, escalatedAt: rek416Notice },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date("2026-10-04T10:46:07.419Z"),
+      }),
+    ).toBe(false);
+  });
+
+  it("still suppresses the measured 54m41s repeat, so the window does not sit under an hour", () => {
+    // REK-428: notice 10:39:50.737Z, action cancelled 11:33:16.211Z, repeat
+    // escalation 11:34:31.956Z. A 30-minute window would let this one through
+    // and put the board back at three notices for one stall.
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          {
+            terminalReason: MEASURED_REASON,
+            escalatedAt: "2026-10-04T10:39:50.737Z",
+          },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date("2026-10-04T11:34:31.956Z"),
+      }),
+    ).toBe(true);
+    expect(DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS).toBe(60 * 60 * 1000);
+  });
+
+  it("notifies immediately for a different terminal reason on the same issue", () => {
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          { terminalReason: MEASURED_REASON, escalatedAt: rek416Notice },
+        ],
+        terminalReason: "budget_exhausted",
+        now: new Date(rek416Repeat),
+      }),
+    ).toBe(false);
+  });
+
+  it("does not suppress records written before notices were timestamped", () => {
+    // Rows escalated by the previous code carry no `escalatedAt`. Treating a
+    // missing timestamp as "recent" would mute the board indefinitely, because
+    // nothing would ever age out.
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          { terminalReason: MEASURED_REASON },
+          null,
+          "unchanged_source_state_exhausted",
+          { terminalReason: MEASURED_REASON, escalatedAt: "not-a-date" },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date(rek416Repeat),
+      }),
+    ).toBe(false);
+  });
+
+  it("ignores a timestamp in the future instead of suppressing forever", () => {
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          { terminalReason: MEASURED_REASON, escalatedAt: "2026-10-04T13:00:00.000Z" },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date(rek416Repeat),
+      }),
+    ).toBe(false);
+  });
+
+  it("never suppresses when the cooldown is switched off", () => {
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          { terminalReason: MEASURED_REASON, escalatedAt: rek416Notice },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date(rek416Repeat),
+        cooldownMs: 0,
+      }),
+    ).toBe(false);
+  });
+
+  it("reads a Date and an epoch stamp as well as an ISO string", () => {
+    const at = new Date(rek416Notice);
+    for (const escalatedAt of [at, at.getTime(), rek416Notice]) {
+      expect(
+        dispositionRepairEscalationRepeatsRecentNotice({
+          priorEvidences: [{ terminalReason: MEASURED_REASON, escalatedAt }],
+          terminalReason: MEASURED_REASON,
+          now: new Date(rek416Repeat),
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("covers what the standing-notice guard cannot see", () => {
+    // The two guards are complementary and the measured window needs both:
+    // guard one needs a standing board-owned action (REK-421's second notice,
+    // 3m21s after the first, with nothing in between), guard two needs the
+    // record of a notice whose action was cleared afterwards (REK-416,
+    // REK-428, REK-496).
+    expect(
+      dispositionRepairEscalationRepeatsStandingNotice({
+        activeKind: "deliberate_wait_without_target",
+        activeOwnerType: "board",
+        activeEvidence: {
+          sourceStateFingerprint: MEASURED_SOURCE_STATE_FINGERPRINT,
+          terminalReason: MEASURED_REASON,
+        },
+        issueStatus: "blocked",
+        sourceStateFingerprint: MEASURED_SOURCE_STATE_FINGERPRINT,
+        terminalReason: MEASURED_REASON,
+      }),
+    ).toBe(true);
+    expect(
+      dispositionRepairEscalationRepeatsStandingNotice({
+        activeKind: null,
+        activeOwnerType: null,
+        activeEvidence: null,
+        issueStatus: "todo",
+        sourceStateFingerprint: MEASURED_SOURCE_STATE_FINGERPRINT,
+        terminalReason: MEASURED_REASON,
+      }),
+    ).toBe(false);
+    expect(
+      dispositionRepairEscalationRepeatsRecentNotice({
+        priorEvidences: [
+          {
+            terminalReason: MEASURED_REASON,
+            sourceStateFingerprint: MEASURED_SOURCE_STATE_FINGERPRINT,
+            escalatedAt: rek416Notice,
+          },
+        ],
+        terminalReason: MEASURED_REASON,
+        now: new Date(rek416Repeat),
+      }),
+    ).toBe(true);
   });
 });

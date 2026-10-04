@@ -12,6 +12,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS } from "./legacy-continuation.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
@@ -73,6 +74,152 @@ export function dispositionRepairDelayMs(attempt: number, fingerprint: string) {
     DISPOSITION_REPAIR_BASE_DELAYS_MS,
     "disposition repair",
   );
+}
+
+function boundedCeiling(value: unknown, fallback: number) {
+  const parsed = typeof value === "number" && Number.isFinite(value)
+    ? Math.floor(value)
+    : fallback;
+  return Math.max(1, parsed);
+}
+
+/**
+ * The ceiling a disposition-repair episode is measured against.
+ *
+ * The legacy spine of {@link LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS} exists for
+ * a run that ended without a recorded disposition *and* without doing work: a
+ * continuation park. A run that succeeded and recorded no error code did its
+ * work — it just failed to write the disposition. Comments are not part of the
+ * durable source state, so no later sweep can tell the two apart, and the short
+ * ceiling escalated the board roughly a second after the assignee's own closing
+ * comment. Spend the regular owner-sticky spine for a succeeded run instead.
+ *
+ * The legacy episode keeps owning the attempt accounting and the episode
+ * fingerprint; only the number it is compared against widens.
+ */
+export function dispositionRepairMaxAttemptsForRun(input: {
+  legacyMaxAttempts?: number | null;
+  runSucceeded: boolean;
+}) {
+  if (!input.runSucceeded) {
+    return boundedCeiling(
+      input.legacyMaxAttempts,
+      LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS,
+    );
+  }
+  return DISPOSITION_REPAIR_MAX_ATTEMPTS;
+}
+
+/**
+ * Whether an escalation would repeat a notice the board already received.
+ *
+ * Identity of a disposition-repair episode is its durable source state, not its
+ * per-run episode fingerprint: the episode id is minted per repair attempt, so
+ * a second sweep over an unchanged source state produced a second, identical
+ * "Agent needs attention" comment and a second identical recovery action. One
+ * standing board escalation per (issue, source state, terminal reason) is the
+ * whole point — the board keeps exactly one decision to make.
+ *
+ * A resolved or retried action is no longer active, so the next sweep mints a
+ * fresh recovery identity and the board is told again. That is deliberate: the
+ * resolve was a decision, and a decision deserves a fresh notice.
+ */
+export function dispositionRepairEscalationRepeatsStandingNotice(input: {
+  activeKind?: string | null;
+  activeOwnerType?: string | null;
+  activeEvidence?: unknown;
+  issueStatus?: string | null;
+  sourceStateFingerprint: string;
+  terminalReason: string;
+}) {
+  if (input.activeKind !== "deliberate_wait_without_target") return false;
+  if (input.activeOwnerType !== "board") return false;
+  // A source issue that is not blocked did not absorb the earlier escalation, so
+  // re-running the full escalation is what puts it back in front of the board.
+  if (input.issueStatus !== "blocked") return false;
+  const evidence = input.activeEvidence && typeof input.activeEvidence === "object"
+    && !Array.isArray(input.activeEvidence)
+    ? input.activeEvidence as Record<string, unknown>
+    : {};
+  if (evidence.sourceStateFingerprint !== input.sourceStateFingerprint) return false;
+  return evidence.terminalReason === input.terminalReason;
+}
+
+/**
+ * How long one issue stays quiet per terminal reason after the board was told.
+ *
+ * Same order of magnitude as the provider-quota backoff
+ * (`PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS`, one hour): that lane already
+ * treats an hour as the shortest honest interval before repeating itself to a
+ * human.
+ */
+export const DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS = 60 * 60 * 1000;
+
+/**
+ * How many recovery-action records of one issue are inspected for an earlier
+ * notice. Newest first, so a limit truncates the oldest history first.
+ */
+export const DISPOSITION_REPAIR_NOTICE_LOOKBACK = 50;
+
+function readEvidenceRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function readEvidenceTimestampMs(value: unknown): number | null {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? null : ms;
+  }
+  return null;
+}
+
+/**
+ * Whether this escalation would repeat a board notice that is still fresh.
+ *
+ * {@link dispositionRepairEscalationRepeatsStandingNotice} only sees a *standing*
+ * board escalation. Anything that takes the source issue off `blocked` clears
+ * `active` on purpose — a handback, and above all the `source_revalidation`
+ * cancel ("stale because the source issue was manually moved from blocked to
+ * todo") — and the next sweep then starts a fresh episode with a fresh notice.
+ * Measured 2026-10-04 over 12h: of 12 `issue.disposition_repair_escalated` rows
+ * in a 3h13m window, 5 repeats followed exactly such a clear, the shortest 42 s
+ * after the board itself moved the issue back to `todo`. Those repeats carry no
+ * new information — the board just decided to retry the same failing agent — so
+ * the escalation still happens (the issue is blocked, the action is board-owned
+ * and resolvable) but the notice is withheld until the window elapses.
+ *
+ * Silence is bounded: after the cooldown the next escalation notifies again, and
+ * a different terminal reason always notifies immediately.
+ */
+export function dispositionRepairEscalationRepeatsRecentNotice(input: {
+  priorEvidences: readonly unknown[];
+  terminalReason: string;
+  now: Date;
+  cooldownMs?: number;
+}) {
+  const cooldownMs = Math.max(
+    0,
+    input.cooldownMs ?? DISPOSITION_REPAIR_NOTICE_COOLDOWN_MS,
+  );
+  if (cooldownMs === 0) return false;
+  const nowMs = input.now.getTime();
+  return input.priorEvidences.some((candidate) => {
+    const evidence = readEvidenceRecord(candidate);
+    if (evidence.terminalReason !== input.terminalReason) return false;
+    const escalatedAtMs = readEvidenceTimestampMs(evidence.escalatedAt);
+    if (escalatedAtMs === null) return false;
+    const ageMs = nowMs - escalatedAtMs;
+    // A future timestamp is not evidence of a notice; ignore it rather than
+    // suppressing forever.
+    return ageMs >= 0 && ageMs < cooldownMs;
+  });
 }
 
 export async function collectDispositionRepairSourceState(

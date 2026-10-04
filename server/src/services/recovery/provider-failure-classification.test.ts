@@ -157,3 +157,70 @@ describe("classifyAdapterFailureForRecovery", () => {
     })).toBeNull();
   });
 });
+
+describe("classifyAdapterFailureForRecovery: bare HTTP 429", () => {
+  // Measured 2026-10-04: SEO Sophie (c20b2006-1f4a-4daf-8613-f122403290bf) sat
+  // at agent status `error` with exactly this errorReason, and two of her issues
+  // were escalated to the board 29 s apart (REK-524 10:46:00.506Z, REK-519
+  // 10:46:29.332Z), both `stranded_assigned_issue` / `adapter_failed`. The
+  // message matches none of the quota prose, so it fell through to the lane that
+  // notifies the board on every failed run.
+  const SEEN_PROVIDER_MESSAGE =
+    'Too Many Requests: {"status":429,"title":"Too Many Requests"}';
+
+  it("reads the provider's bare 429 as a quota condition with bounded backoff, not a board escalation", () => {
+    const now = new Date("2026-10-04T10:46:04.627Z");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: SEEN_PROVIDER_MESSAGE,
+      resultJson: null,
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
+      parsedResetTime: false,
+    });
+  });
+
+  it.each([
+    ["HTTP status line", "HTTP/1.1 429 Too Many Requests"],
+    ["bare status code", "upstream returned 429"],
+    ["status code in a body", 'upstream said {"status": 429, "detail": "slow down"}'],
+    ["named status code", 'error: status_code=429'],
+    ["rate limit prose", "API rate limit exceeded for this key"],
+  ])("classifies a 429 carried as %s", (_label, error) => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error,
+      resultJson: null,
+    })).toMatchObject({ kind: "provider_quota" });
+  });
+
+  it("still honours a reset timestamp the provider did send", () => {
+    const now = new Date("2026-10-04T10:46:04.627Z");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: SEEN_PROVIDER_MESSAGE,
+      resultJson: { retryNotBefore: "2026-10-04T11:16:04.627Z" },
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-10-04T11:16:04.627Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("keeps a genuine capacity limit out of the quota lane", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: "Workspace storage capacity limit reached.",
+      resultJson: null,
+    })).toBeNull();
+  });
+
+  it("keeps a non-adapter failure out of the quota lane even with a 429 in its text", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "timeout",
+      error: "Downstream service replied 429 Too Many Requests.",
+      resultJson: null,
+    })).toBeNull();
+  });
+});

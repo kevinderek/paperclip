@@ -123,6 +123,7 @@ import {
   buildSuccessfulRunHandoffExhaustedNotice,
   isPluginManagedIssueLifecycle,
   noticeMetadataReferencesRecoveryAction,
+  routineExecutionCarrierRoutineId,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import {
@@ -878,6 +879,24 @@ function isSuccessfulInProgressContinuationRun(
   latestRun: LatestIssueRun,
 ): latestRun is SuccessfulLatestIssueRun {
   return latestRun?.status === "succeeded";
+}
+
+/**
+ * The routine-carrier half of "an active routine owns this issue's next action".
+ *
+ * A routine execution carrier keeps the routine in `originId` and has no
+ * `parentIssueId` of its own, so `routines.parentIssueId = issue.id` can never
+ * match one and any check written in that shape alone is blind to every carrier
+ * this platform creates. Returns the extra `routines` predicate for the carrier
+ * form, or an empty list for every other issue — the caller keeps its own
+ * `parentIssueId` branch, so the two shapes stay distinguishable.
+ */
+function activeCarrierRoutineClauses(issue: {
+  originKind?: string | null;
+  originId?: string | null;
+}) {
+  const carrierRoutineId = routineExecutionCarrierRoutineId(issue);
+  return carrierRoutineId ? [eq(routines.id, carrierRoutineId)] : [];
 }
 
 function isProductiveContinuationRun(latestRun: LatestIssueRun) {
@@ -3758,7 +3777,7 @@ export function recoveryService(
       isInvocationBudgetBlocked(issue, run.agentId),
       readChatControlRecoveryStop(db, { companyId: issue.companyId, issueId: issue.id, agentId: run.agentId, sourceRunId: run.id }),
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
-      db.select({ id: routines.id }).from(routines).where(and(eq(routines.companyId, issue.companyId), eq(routines.parentIssueId, issue.id), eq(routines.status, "active"))).limit(1),
+      db.select({ id: routines.id }).from(routines).where(and(eq(routines.companyId, issue.companyId), or(eq(routines.parentIssueId, issue.id), ...activeCarrierRoutineClauses(issue)), eq(routines.status, "active"))).limit(1),
       db.select({ status: agentTaskSessions.goalStatus }).from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, issue.companyId), eq(agentTaskSessions.agentId, run.agentId), eq(agentTaskSessions.taskKey, issue.id))).limit(1),
       getLatestIssueRun(issue.companyId, issue.id),
       hasPersistedDurableWaitPath(issue, run),
@@ -5290,6 +5309,43 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
+        continue;
+      }
+
+      // A routine execution carrier's disposition belongs to the routine that
+      // created it: the next fire of an active routine opens a fresh carrier, so
+      // an `in_progress` carrier whose own run has ended is not stranded work,
+      // it is a carrier waiting to be closed by the agent that ran it. Generic
+      // stranded-issue recovery cannot tell that apart from real stranded work,
+      // so it spends a full agent run per attempt on a disposition-only prompt
+      // ("choose exactly one outcome") that the routine's own instructions
+      // already answered. Same reason and same shape as
+      // `isPluginManagedIssueLifecycle`: leave the lifecycle to its owner.
+      //
+      // Deliberately narrow, and deliberately only for `in_progress`:
+      //   - a `todo` carrier that never got a wake is genuinely stranded and
+      //     must still be dispatched by the assignment lane above;
+      //   - `routines.status = 'active'` is part of the query, so a carrier of a
+      //     paused or archived routine has no continuation to wait for and keeps
+      //     the generic escalation path.
+      const carrierRoutineId = routineExecutionCarrierRoutineId(issue);
+      if (
+        issue.status === "in_progress" &&
+        carrierRoutineId &&
+        (await db
+          .select({ id: routines.id })
+          .from(routines)
+          .where(
+            and(
+              eq(routines.companyId, issue.companyId),
+              eq(routines.status, "active"),
+              eq(routines.id, carrierRoutineId),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null))
+      ) {
+        result.skipped += 1;
         continue;
       }
 

@@ -142,6 +142,8 @@ import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js"
 import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
+  dispositionRepairEscalationRepeatsStandingNotice,
+  dispositionRepairMaxAttemptsForRun,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
 } from "./disposition-repair.js";
 import {
@@ -236,6 +238,15 @@ type LatestIssueRun =
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & {
   status: "succeeded";
 };
+
+/**
+ * A run that succeeded and recorded no error code did its work. It is not a
+ * continuation park, and it must not be measured against the short legacy
+ * ceiling that exists for parks.
+ */
+function isSuccessfulIssueRun(latestRun: LatestIssueRun): latestRun is SuccessfulLatestIssueRun {
+  return latestRun?.status === "succeeded" && !latestRun?.errorCode;
+}
 
 export type StrandedRecoveryCause =
   | "stranded_assigned_issue"
@@ -382,9 +393,10 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   if (latestRun?.errorCode === "provider_quota") return true;
   if (readRecoveryRunErrorFamily(latestRun) === "provider_quota") return true;
   if (latestRun?.errorCode !== "adapter_failed") return false;
+  const error = latestRun.error ?? "";
   return /(?:usage|rate|quota) limit|you(?:'|’)ve hit your (?:\w+ )?limit|quota (?:exceeded|reset)|try again after/i.test(
-    latestRun.error ?? "",
-  );
+    error,
+  ) || PROVIDER_RATE_LIMIT_ERROR_RE.test(error);
 }
 
 function resolveStrandedRecoveryCause(
@@ -529,6 +541,15 @@ export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
+// A bare HTTP 429 carries no quota prose at all. The measured provider message
+// `Too Many Requests: {"status":429,"title":"Too Many Requests"}` matches none
+// of PROVIDER_QUOTA_ERROR_RE, so it fell through to `stranded_assigned_issue`,
+// which `shouldRouteRecoveryToOriginalAgent` sends to the board — one notice
+// per failed run. A 429 is the same condition the quota lane already handles
+// (bounded backoff inside recovery, original assignee retried, no board notice),
+// so recognise the status code and the title as well as the prose.
+const PROVIDER_RATE_LIMIT_ERROR_RE =
+  /too many requests|rate[ _-]?limit(?:ed|ing| exceeded)?|\b429\b|status(?:[_ ]code)?["'\s:=-]{1,6}429|http\/1\.[01] 429/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
 
@@ -647,7 +668,8 @@ export function classifyAdapterFailureForRecovery(
   }
   if (
     latestRun.errorCode !== "provider_quota" &&
-    !PROVIDER_QUOTA_ERROR_RE.test(error)
+    !PROVIDER_QUOTA_ERROR_RE.test(error) &&
+    !PROVIDER_RATE_LIMIT_ERROR_RE.test(error)
   )
     return null;
 
@@ -3077,9 +3099,20 @@ export function recoveryService(
     const recorded = Math.floor(
       asNumber(evidence?.sourceAttemptCount, row.attemptCount),
     );
-    // The recorded count can never lower a spent budget; a write that left it
-    // below the ceiling still means this digest already exhausted its attempts.
-    return recorded >= maxAttempts ? recorded : maxAttempts;
+    // Seed against the ceiling that escalation actually ran under, not the
+    // ceiling in force today. Returning the current `maxAttempts` here made a
+    // later, looser budget unreachable: a succeeded run that escalates on the
+    // legacy spine of 2 wrote `sourceMaxAttempts: 2`, and any sweep that
+    // widened the ceiling to 5 read that row as a fully spent budget and
+    // escalated again on the spot. Returning `recorded` against the recorded
+    // ceiling keeps both guarantees: a budget spent under its own ceiling stays
+    // spent (the reopen loop is still closed), and the extra attempts of a
+    // wider ceiling are genuinely available.
+    const recordedCeiling = Math.floor(
+      asNumber(evidence?.sourceMaxAttempts, maxAttempts),
+    );
+    const spentCeiling = Math.max(1, Math.min(maxAttempts, recordedCeiling));
+    return recorded >= spentCeiling ? Math.min(maxAttempts, recorded) : spentCeiling;
   }
 
   async function ensureDispositionRepairAction(input: {
@@ -3090,14 +3123,29 @@ export function recoveryService(
     attemptCount: number;
     legacyEpisode?: LegacyDispositionEpisode;
   }) {
+    const sourceStateFingerprint = input.sourceStateFingerprint ?? input.fingerprint;
     let active = await recoveryActionsSvc.getActiveForIssue(
       input.issue.companyId,
       input.issue.id,
     );
+    // Identity is the durable source state, never the per-episode fingerprint.
+    // The episode id is minted per repair run, so comparing `fingerprint` here
+    // read every fresh repair as "source_state_changed": it cancelled the
+    // standing board escalation, built a new recovery action and let the sweep
+    // arm a second identical notice. Measured 2026-10-04 in a 2h32m window:
+    // 8 `issue.disposition_repair_escalated` rows over 4 source issues, every
+    // pair sharing one `sourceStateFingerprint` and differing only in
+    // `episodeFingerprint`. The digest is the field that stays equal across a
+    // reopening, so it is the field that decides identity here too.
+    const activeSourceStateFingerprint = active
+      ? readNonEmptyString(
+          parseObject(active.evidence).sourceStateFingerprint,
+        ) ?? active.fingerprint
+      : null;
     if (
       active &&
       (active.kind !== "deliberate_wait_without_target" ||
-        active.fingerprint !== input.fingerprint)
+        activeSourceStateFingerprint !== sourceStateFingerprint)
     ) {
       await recoveryActionsSvc.resolveActiveForIssue({
         companyId: input.issue.companyId,
@@ -3593,6 +3641,7 @@ export function recoveryService(
     terminalReason: string;
     legacyEpisode?: LegacyDispositionEpisode;
   }) {
+    const sourceStateFingerprint = input.sourceStateFingerprint ?? input.fingerprint;
     const action = await ensureDispositionRepairAction({
       issue: input.issue,
       latestRun: input.latestRun,
@@ -3601,6 +3650,27 @@ export function recoveryService(
       attemptCount: input.attemptCount,
       legacyEpisode: input.legacyEpisode,
     });
+    // One escalation per episode. A standing board escalation for this exact
+    // source state and this exact terminal reason is already the notice the
+    // board received; arming it again would post a second identical
+    // "Agent needs attention" comment and a second identical activity row for
+    // the same episode. The source issue stays `blocked` and the action stays
+    // board-owned, so nothing is lost — the board keeps one decision to make.
+    // A board that resolved or retried the action clears `active`, and the next
+    // sweep mints a fresh recovery identity with a fresh notice, because that
+    // resolve was a decision.
+    if (
+      dispositionRepairEscalationRepeatsStandingNotice({
+        activeKind: action.kind,
+        activeOwnerType: action.ownerType,
+        activeEvidence: action.evidence,
+        issueStatus: input.issue.status,
+        sourceStateFingerprint,
+        terminalReason: input.terminalReason,
+      })
+    ) {
+      return null;
+    }
     const now = new Date();
     await db
       .update(issueRecoveryActions)
@@ -3618,7 +3688,7 @@ export function recoveryService(
           // The durable digest, never the per-episode fingerprint: this field is
           // what a later sweep matches on to decide whether the budget for this
           // unchanged source state is already spent.
-          sourceStateFingerprint: input.sourceStateFingerprint ?? input.fingerprint,
+          sourceStateFingerprint: sourceStateFingerprint,
           episodeFingerprint: input.fingerprint,
           terminalReason: input.terminalReason,
           sourceAttemptCount: input.attemptCount,
@@ -3831,10 +3901,30 @@ export function recoveryService(
     if (!current || current.status === "done" || current.status === "cancelled")
       return "skipped";
 
-    const episode = options.legacyEpisode ?? (
+    const legacyEpisode = options.legacyEpisode ?? (
       parseObject(parseObject(latestRun?.contextSnapshot).legacyDispositionEpisode).id && latestRun
         ? legacyDispositionEpisode(latestRun) : undefined
     );
+    // A succeeded run is not a continuation park. The legacy spine of 2 exists
+    // for a run that ended without a recorded disposition *and* without doing
+    // work; a run that succeeded recorded an outcome — measured on REK-428, the
+    // escalation landed 1,1 s after the assignee's own "REK-428 afgerond."
+    // comment with `latestRunStatus: succeeded` and `latestRunErrorCode: null`.
+    // Comments are not part of the durable source state, so no sweep can tell
+    // that run apart from one that did nothing. Spend the regular owner-sticky
+    // spine (5 attempts, 0/60/120/240/480 s) instead of escalating the board
+    // seconds after the closing comment. The episode keeps owning the attempt
+    // accounting and the episode fingerprint, so nothing else about the lane
+    // moves; only the ceiling it is measured against widens.
+    const episode = legacyEpisode
+      ? {
+          ...legacyEpisode,
+          maxAttempts: dispositionRepairMaxAttemptsForRun({
+            legacyMaxAttempts: legacyEpisode.maxAttempts,
+            runSucceeded: isSuccessfulIssueRun(latestRun),
+          }),
+        }
+      : undefined;
     const maxAttempts = episode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS;
     const dependencyWait = episode ? null : await resolveContinuationWaitingOnReview(current);
     if (dependencyWait) {

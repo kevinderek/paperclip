@@ -12,6 +12,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS } from "./legacy-continuation.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
@@ -73,6 +74,75 @@ export function dispositionRepairDelayMs(attempt: number, fingerprint: string) {
     DISPOSITION_REPAIR_BASE_DELAYS_MS,
     "disposition repair",
   );
+}
+
+function boundedCeiling(value: unknown, fallback: number) {
+  const parsed = typeof value === "number" && Number.isFinite(value)
+    ? Math.floor(value)
+    : fallback;
+  return Math.max(1, parsed);
+}
+
+/**
+ * The ceiling a disposition-repair episode is measured against.
+ *
+ * The legacy spine of {@link LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS} exists for
+ * a run that ended without a recorded disposition *and* without doing work: a
+ * continuation park. A run that succeeded and recorded no error code did its
+ * work — it just failed to write the disposition. Comments are not part of the
+ * durable source state, so no later sweep can tell the two apart, and the short
+ * ceiling escalated the board roughly a second after the assignee's own closing
+ * comment. Spend the regular owner-sticky spine for a succeeded run instead.
+ *
+ * The legacy episode keeps owning the attempt accounting and the episode
+ * fingerprint; only the number it is compared against widens.
+ */
+export function dispositionRepairMaxAttemptsForRun(input: {
+  legacyMaxAttempts?: number | null;
+  runSucceeded: boolean;
+}) {
+  if (!input.runSucceeded) {
+    return boundedCeiling(
+      input.legacyMaxAttempts,
+      LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS,
+    );
+  }
+  return DISPOSITION_REPAIR_MAX_ATTEMPTS;
+}
+
+/**
+ * Whether an escalation would repeat a notice the board already received.
+ *
+ * Identity of a disposition-repair episode is its durable source state, not its
+ * per-run episode fingerprint: the episode id is minted per repair attempt, so
+ * a second sweep over an unchanged source state produced a second, identical
+ * "Agent needs attention" comment and a second identical recovery action. One
+ * standing board escalation per (issue, source state, terminal reason) is the
+ * whole point — the board keeps exactly one decision to make.
+ *
+ * A resolved or retried action is no longer active, so the next sweep mints a
+ * fresh recovery identity and the board is told again. That is deliberate: the
+ * resolve was a decision, and a decision deserves a fresh notice.
+ */
+export function dispositionRepairEscalationRepeatsStandingNotice(input: {
+  activeKind?: string | null;
+  activeOwnerType?: string | null;
+  activeEvidence?: unknown;
+  issueStatus?: string | null;
+  sourceStateFingerprint: string;
+  terminalReason: string;
+}) {
+  if (input.activeKind !== "deliberate_wait_without_target") return false;
+  if (input.activeOwnerType !== "board") return false;
+  // A source issue that is not blocked did not absorb the earlier escalation, so
+  // re-running the full escalation is what puts it back in front of the board.
+  if (input.issueStatus !== "blocked") return false;
+  const evidence = input.activeEvidence && typeof input.activeEvidence === "object"
+    && !Array.isArray(input.activeEvidence)
+    ? input.activeEvidence as Record<string, unknown>
+    : {};
+  if (evidence.sourceStateFingerprint !== input.sourceStateFingerprint) return false;
+  return evidence.terminalReason === input.terminalReason;
 }
 
 export async function collectDispositionRepairSourceState(

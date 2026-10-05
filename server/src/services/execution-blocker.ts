@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, not, or, sql } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
 import { heartbeatRuns, issueComments, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
@@ -10,7 +10,12 @@ export function executionBlockerPredicate() {
     not(conversationRecoveryActionPredicate()!),
     inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
-      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
+      // A settled no-replay disposition keeps its evidence but not its hold. The
+      // replay flag alone used to be enough, which made a resolved row hold its
+      // issue on every wake and turned a PATCH back to todo into a no-op. The
+      // slot ends where the disposition is released; the signal stays readable.
+      and(sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        isNull(issueRecoveryActions.releasedAt))),
   );
 }
 

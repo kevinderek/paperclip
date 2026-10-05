@@ -40,6 +40,10 @@ export const issueRecoveryActions = pgTable(
     outcome: text("outcome"),
     resolutionNote: text("resolution_note"),
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    // A recorded no-replay disposition keeps its evidence but not its hold.
+    // Without this marker the resolved row matched the blocker predicate on
+    // every wake, so an interrupted run parked its issue on blocked for good.
+    releasedAt: timestamp("released_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

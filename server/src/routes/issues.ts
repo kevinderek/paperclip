@@ -4255,6 +4255,59 @@ export function issueRoutes(
     return null;
   }
 
+  /**
+   * Automatic recovery resolves its own action and then keeps a no-replay hold on
+   * it, because the stopped run's action outcomes stay unverified. Such a settled
+   * record is invisible to `getActiveForIssue`, so the staleness rules above never
+   * reached it: a source issue that reached `done` kept a hold no route, read or
+   * comment could clear, and every later wake died on it. The same rules apply
+   * here — a durable source change releases the hold, nothing else does.
+   */
+  async function releaseStaleSettledDispatchHold(
+    input: Parameters<typeof revalidateActiveSourceRecovery>[0],
+  ) {
+    const settledHold = await recoveryActionsSvc.getSettledDispatchHoldForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (!settledHold) return null;
+
+    const resolutionNote = await classifySourceRecoveryRevalidation(input);
+    if (!resolutionNote) return null;
+
+    const released = await recoveryActionsSvc.releaseSettledDispatchHold({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      actionId: settledHold.id,
+      resolutionNote,
+    });
+    if (!released) return null;
+
+    const actor = input.actor;
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: actor?.actorType ?? "system",
+      actorId: actor?.actorId ?? "system",
+      agentId: actor?.agentId ?? null,
+      runId: actor?.runId ?? null,
+      action: "issue.recovery_dispatch_hold_released",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        recoveryActionId: released.id,
+        recoveryActionStatus: released.status,
+        outcome: released.outcome,
+        sourceIssueStatus: input.issue.status,
+        resolutionNote,
+        source: "source_revalidation",
+        trigger: input.trigger,
+      },
+    });
+
+    return null;
+  }
+
   async function revalidateActiveSourceRecovery(input: {
     issue: IssueRouteSnapshot;
     trigger: RecoveryRevalidationTrigger;
@@ -4280,7 +4333,9 @@ export function issueRoutes(
             input.issue.id,
           )
         : input.activeRecoveryAction;
-    if (!activeRecoveryAction) return null;
+    if (!activeRecoveryAction) {
+      return await releaseStaleSettledDispatchHold(input);
+    }
 
     const resolutionNote = await classifySourceRecoveryRevalidation(input);
     if (!resolutionNote) return activeRecoveryAction;

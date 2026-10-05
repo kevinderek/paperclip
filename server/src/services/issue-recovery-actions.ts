@@ -13,6 +13,9 @@ import type {
 import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
+const SETTLED_RECOVERY_ACTION_STATUSES = ["resolved", "cancelled"] as const satisfies readonly IssueRecoveryActionStatus[];
+/** The verdict a staleness pass leaves behind when it releases a settled no-replay hold. */
+const RELEASED_REPLAY_VERDICT = "released_stale_source_change";
 const MAX_UPSERT_RETRIES = 3;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
@@ -236,6 +239,75 @@ export function issueRecoveryActionService(db: Db) {
     const action = toReadModel(row);
     await projectNativeRunActivity(companyId, [action], dbOrTx);
     return action;
+  }
+
+  /**
+   * A settled record can still exert a dispatch hold: automatic recovery writes
+   * `automaticRecovery.replay = 'blocked'` and keeps it after `resolved`, because
+   * the stopped run's action outcomes stay unverified. That hold is invisible to
+   * `getActiveForIssue`, which only ever looks at open rows, so nothing in the
+   * staleness pass could ever reach it. This is the only read path for that row.
+   */
+  async function getSettledDispatchHoldForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const row = await dbOrTx
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          inArray(issueRecoveryActions.status, [...SETTLED_RECOVERY_ACTION_STATUSES]),
+          sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row) return null;
+    return toReadModel(row);
+  }
+
+  /**
+   * Release the dispatch hold of a settled record without rewriting its history.
+   * The status, outcome and evidence of the original disposition are evidence of
+   * an unverified outcome and stay as they are; only the no-replay flag moves, so
+   * the record keeps explaining itself while it stops blocking dispatch.
+   */
+  async function releaseSettledDispatchHold(
+    input: {
+      companyId: string;
+      sourceIssueId: string;
+      actionId: string;
+      resolutionNote: string;
+    },
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const now = new Date();
+    const [updated] = await dbOrTx
+      .update(issueRecoveryActions)
+      .set({
+        resolutionNote: input.resolutionNote,
+        wakePolicy: null,
+        monitorPolicy: null,
+        updatedAt: now,
+        evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', ${JSON.stringify(RELEASED_REPLAY_VERDICT)}::jsonb) ||
+          ${JSON.stringify({ dispatchHoldReleasedAt: now.toISOString(), dispatchHoldReleaseNote: input.resolutionNote })}::jsonb`,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.id, input.actionId),
+          eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+          inArray(issueRecoveryActions.status, [...SETTLED_RECOVERY_ACTION_STATUSES]),
+          sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        ),
+      )
+      .returning();
+    return updated ? toReadModel(updated) : null;
   }
 
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
@@ -569,7 +641,9 @@ export function issueRecoveryActionService(db: Db) {
 
   return {
     getActiveForIssue,
+    getSettledDispatchHoldForIssue,
     listActiveForIssues,
+    releaseSettledDispatchHold,
     resolveActiveForIssue,
     upsertSourceScoped,
   };

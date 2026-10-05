@@ -26,6 +26,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import {
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
@@ -35,6 +36,7 @@ import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbe
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
@@ -145,7 +147,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     process.env.WORKSPACE_OPERATION_LOG_BASE_PATH = operationLogRoot;
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-recovery-actions-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     await db.delete(workspaceOperations);
@@ -2441,6 +2443,119 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       trigger: "read_projection",
       recoveryActionId: action.id,
     });
+  });
+
+  // Automatic recovery resolves its own action and then keeps a no-replay hold on
+  // it. That settled row was invisible to every staleness pass, so a source issue
+  // that reached `done` kept a dispatch hold nothing could clear.
+  async function seedSettledDispatchHold(
+    companyId: string,
+    sourceIssueId: string,
+    ownerAgentId: string,
+  ) {
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId,
+      kind: "active_run_watchdog",
+      status: "resolved",
+      ownerType: "board",
+      returnOwnerAgentId: ownerAgentId,
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${randomUUID()}`,
+      evidence: {
+        // No matching heartbeat_runs row, so this is a settled dispatch hold and
+        // not a conversation continuation hold.
+        runId: randomUUID(),
+        automaticRecovery: {
+          policy: "preserve_without_replay_v1",
+          replay: "blocked",
+          actionOutcome: "unknown",
+        },
+      },
+      nextAction: "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing.",
+      outcome: "blocked",
+      resolutionNote: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+      resolvedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return actionId;
+  }
+
+  it("releases a settled no-replay dispatch hold once the source issue reached done", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const actionId = await seedSettledDispatchHold(companyId, sourceIssueId, coderId);
+    // The hold is real before the read: this is the predicate that killed every wake.
+    expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toMatchObject({
+      recoveryActionId: actionId,
+      cause: "legacy_execution_requires_reconciliation",
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+    const app = createApp();
+
+    await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+
+    expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toBeNull();
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    // The disposition itself stays: it is the record of an unverified outcome.
+    expect(actionRow).toMatchObject({ status: "resolved", outcome: "blocked" });
+    expect(
+      (actionRow?.evidence as Record<string, Record<string, unknown>>).automaticRecovery,
+    ).toMatchObject({
+      policy: "preserve_without_replay_v1",
+      replay: "released_stale_source_change",
+      actionOutcome: "unknown",
+    });
+    expect(actionRow?.resolutionNote).toBe(
+      "Recovery action became stale because the source issue reached done.",
+    );
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(
+      activityRows.find((row) => row.action === "issue.recovery_dispatch_hold_released")?.details,
+    ).toMatchObject({
+      source: "source_revalidation",
+      trigger: "read_projection",
+      recoveryActionId: actionId,
+      recoveryActionStatus: "resolved",
+      outcome: "blocked",
+    });
+  });
+
+  it("keeps a settled no-replay dispatch hold while nothing about the source changed", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const actionId = await seedSettledDispatchHold(companyId, sourceIssueId, coderId);
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
+    const app = createApp();
+
+    await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/comments`)
+      .send({ body: "I am looking at this, but not changing the disposition." })
+      .expect(201);
+
+    // An unverified outcome keeps its hold. Only a durable source change releases it.
+    expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toMatchObject({
+      recoveryActionId: actionId,
+    });
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(
+      (actionRow?.evidence as Record<string, Record<string, unknown>>).automaticRecovery?.replay,
+    ).toBe("blocked");
   });
 
   it("keeps active recovery visible when a plain comment does not create a live path", async () => {

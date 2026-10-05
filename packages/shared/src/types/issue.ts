@@ -270,6 +270,12 @@ export interface IssueWakeDiagnosticWakeRequest {
   agentId: string | null;
   source: string;
   reason: string | null;
+  /**
+   * The raw `agent_wakeup_requests.reason`, before `reason` collapses it to
+   * `other`. A wake whose gate fired has its requested reason overwritten by the
+   * kill reason, so this is the only field that says which gate stopped it.
+   */
+  requestedReason: string | null;
   status: string;
   coalescedCount: number;
   runId: string | null;

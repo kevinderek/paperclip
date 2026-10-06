@@ -482,6 +482,9 @@ export async function settleUnrecoverableExecutions(
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         let nativeBootstrapFailureBlock = action.evidence.nativeBootstrapFailureBlock;
+        const unsafeWorkspaceRestore =
+          hasWorkspaceRestoreFailure(run.resultJson) ||
+          action.evidence.workspaceRestoreFailure === "restore_unsafe_archive";
         if (current) {
           const [projected] = await tx
             .update(issues)
@@ -509,6 +512,12 @@ export async function settleUnrecoverableExecutions(
             outcome: current ? "blocked" : "cancelled",
             resolvedAt: now,
             updatedAt: now,
+            // Recording the disposition is also the end of the hold it created.
+            // Leaving the hold open here made every settled interruption a
+            // permanent platform-hold: the card accepted todo and lost it again
+            // on the next wake. An unsafe workspace restore is the one hold that
+            // must survive the settle, because no provider turn can repair it.
+            releasedAt: unsafeWorkspaceRestore ? null : now,
             nextAction: note,
             resolutionNote: note,
             wakePolicy: null,

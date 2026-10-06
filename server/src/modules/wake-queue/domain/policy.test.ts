@@ -6,6 +6,7 @@ import {
   decideQueuedCommentReorder,
   decideQueuedCommentWakeLookup,
   decideReleaseRecovery,
+  decideStrandedWakeFallback,
   decideWakeAdmission,
   decideWakeOutcome,
   deriveImmediateRecoveryContextLabels,
@@ -17,6 +18,7 @@ import {
   type QueuedCommentReorderFacts,
   type QueuedCommentWakeLookupFacts,
   type ReleaseRecoveryFacts,
+  type StrandedWakeFallbackFacts,
   type WakeAdmissionFacts,
 } from "./policy.js";
 
@@ -712,4 +714,143 @@ describe("decideQueuedCommentActorOwnsEntry", () => {
       expect(decideQueuedCommentActorOwnsEntry(testCase.facts)).toBe(testCase.expected);
     });
   }
+});
+
+describe("decideStrandedWakeFallback", () => {
+  const MINUTE = 60_000;
+  const baseStrandedFacts: StrandedWakeFallbackFacts = {
+    liveExecutionPresent: false,
+    activePauseHold: false,
+    executionBlocked: false,
+    issueTerminal: false,
+    hasUndeliveredUserComment: true,
+    waitingMs: 5 * MINUTE,
+    staleAfterMs: 60 * MINUTE,
+    priorAttempts: 0,
+    maxAttempts: 5,
+  };
+
+  const cases: Array<{
+    name: string;
+    facts: StrandedWakeFallbackFacts;
+    expected: ReturnType<typeof decideStrandedWakeFallback>;
+  }> = [
+    // The positive class: a stranded wake with an owner-free issue and live
+    // queued comments is exactly the case that waited 1.3 days before.
+    {
+      name: "redispatch: the owning run released the issue and a human comment is still undelivered",
+      facts: baseStrandedFacts,
+      expected: { kind: "redispatch" },
+    },
+    {
+      name: "wait: a live run still targets this issue",
+      facts: { ...baseStrandedFacts, liveExecutionPresent: true },
+      expected: { kind: "wait" },
+    },
+    {
+      name: "wait: an active subtree pause hold covers the issue",
+      facts: { ...baseStrandedFacts, activePauseHold: true },
+      expected: { kind: "wait" },
+    },
+    {
+      name: "wait: a platform execution hold covers the issue",
+      facts: { ...baseStrandedFacts, executionBlocked: true },
+      expected: { kind: "wait" },
+    },
+    {
+      name: "wait: an execution hold outranks a terminal issue, so the hold stays visible",
+      facts: { ...baseStrandedFacts, executionBlocked: true, issueTerminal: true },
+      expected: { kind: "wait" },
+    },
+    {
+      name: "retire: the issue is done and nothing is left to deliver",
+      facts: { ...baseStrandedFacts, issueTerminal: true, hasUndeliveredUserComment: false },
+      expected: { kind: "retire", reason: "issue_terminal" },
+    },
+    // The safety property, measured on REK-551: a card that is `done` while a
+    // human comment is still undelivered must go back through the normal drain,
+    // which reopens a closed card for exactly that input. Retiring it here
+    // would drop the message.
+    {
+      name: "redispatch: a done issue with an undelivered human comment returns to the reopen path",
+      facts: { ...baseStrandedFacts, issueTerminal: true },
+      expected: { kind: "redispatch" },
+    },
+    {
+      name: "retire: nothing undelivered is left to run",
+      facts: { ...baseStrandedFacts, hasUndeliveredUserComment: false },
+      expected: { kind: "retire", reason: "no_undelivered_comments" },
+    },
+    {
+      name: "retire: the waiting bound is reached while no owner explains the wait",
+      facts: { ...baseStrandedFacts, waitingMs: 60 * MINUTE },
+      expected: { kind: "retire", reason: "attempt_budget_exhausted" },
+    },
+    {
+      name: "retire: one second before the bound still redispatches",
+      facts: { ...baseStrandedFacts, waitingMs: 60 * MINUTE - 1 },
+      expected: { kind: "redispatch" },
+    },
+    {
+      name: "retire: the attempt budget is exhausted before the waiting bound",
+      facts: { ...baseStrandedFacts, priorAttempts: 5 },
+      expected: { kind: "retire", reason: "attempt_budget_exhausted" },
+    },
+    {
+      name: "retire: an attempt short of the budget still redispatches",
+      facts: { ...baseStrandedFacts, priorAttempts: 4 },
+      expected: { kind: "redispatch" },
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(testCase.name, () => {
+      expect(decideStrandedWakeFallback(testCase.facts)).toEqual(testCase.expected);
+    });
+  }
+
+  // AC3, measured as a negative control: a wake that has waited past the bound
+  // must not be left in the state the defect produced. Before this rule the row
+  // stayed `deferred_issue_execution` and the sweep re-selected it forever.
+  it("a wake past the waiting bound never returns a state that re-selects it", () => {
+    for (const waitingMs of [0, MINUTE, 60 * MINUTE, 31 * 24 * 60 * MINUTE]) {
+      expect(decideStrandedWakeFallback({ ...baseStrandedFacts, waitingMs })).not.toEqual({ kind: "wait" });
+    }
+  });
+
+  // Every retire branch must name its reason: an unnamed retirement is the
+  // unreadable end state this fix exists to remove.
+  it("every retire outcome carries the reason that closed it", () => {
+    const retired = [
+      decideStrandedWakeFallback({ ...baseStrandedFacts, issueTerminal: true, hasUndeliveredUserComment: false }),
+      decideStrandedWakeFallback({ ...baseStrandedFacts, hasUndeliveredUserComment: false }),
+      decideStrandedWakeFallback({ ...baseStrandedFacts, waitingMs: 60 * MINUTE }),
+    ];
+    expect(retired.every((decision) => decision.kind === "retire")).toBe(true);
+    expect(retired.map((decision) => (decision.kind === "retire" ? decision.reason : null))).toEqual([
+      "issue_terminal",
+      "no_undelivered_comments",
+      "attempt_budget_exhausted",
+    ]);
+  });
+
+  // AC3 as a safety property: a wake that still owes a human message is never
+  // retired for a reason that does not say so. Only the budget may close it, and
+  // the caller hands the comment to the delivery path before that happens.
+  it("never retires an undelivered human comment without naming the budget", () => {
+    const holdingComment: StrandedWakeFallbackFacts = { ...baseStrandedFacts, hasUndeliveredUserComment: true };
+    for (const facts of [
+      { ...holdingComment },
+      { ...holdingComment, issueTerminal: true },
+      { ...holdingComment, activePauseHold: true },
+      { ...holdingComment, executionBlocked: true },
+    ]) {
+      expect(decideStrandedWakeFallback(facts)).not.toEqual({ kind: "retire", reason: "issue_terminal" });
+      expect(decideStrandedWakeFallback(facts)).not.toEqual({ kind: "retire", reason: "no_undelivered_comments" });
+    }
+    // Only the bound, and only once it is actually reached, may close it.
+    expect(decideStrandedWakeFallback(holdingComment)).toEqual({ kind: "redispatch" });
+    expect(decideStrandedWakeFallback({ ...holdingComment, waitingMs: 60 * MINUTE }))
+      .toEqual({ kind: "retire", reason: "attempt_budget_exhausted" });
+  });
 });

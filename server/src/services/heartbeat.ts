@@ -378,6 +378,7 @@ import {
 } from "./issue-rewake-throttle.js";
 import {
   logActivity,
+  persistActivity,
   publishPluginDomainEvent,
   type LogActivityInput,
 } from "./activity-log.js";
@@ -547,6 +548,13 @@ import {
   type ReleaseRecoveryBlockedNoticeKind,
   type RunSnapshot as WakeQueueRunSnapshot,
 } from "../modules/wake-queue/index.js";
+import {
+  decideStrandedWakeFallback,
+  STRANDED_WAKE_MAX_ATTEMPTS,
+  STRANDED_WAKE_STALE_AFTER_MS,
+  STRANDED_WAKE_RETIRE_REASONS,
+  type StrandedWakeRetireReason,
+} from "../modules/wake-queue/domain/policy.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
   decideIssueReviewPathRecovery,
@@ -8278,6 +8286,20 @@ function isHeartbeatRunTerminalStatus(
   );
 }
 
+const STRANDED_SWEEP_ATTEMPTS_KEY = "strandedSweepAttempts";
+
+/**
+ * Reads how many times the stranded-wake sweep has already examined this wake.
+ * Stored on the wake payload so the budget survives a restart; a payload that
+ * never carried the key has not been examined yet.
+ */
+function strandedSweepAttemptCount(payload: unknown): number {
+  const value = parseObject(payload)[STRANDED_SWEEP_ATTEMPTS_KEY];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : 0;
+}
+
 function isHeartbeatRunRuntimeStatusActive(
   status: string | null | undefined,
 ): boolean {
@@ -10369,6 +10391,55 @@ export function heartbeatService(
         idempotencyKey: `remote-stop-comment:${run.id}:${wake.id}` }, wake.id);
       break;
     }
+  }
+
+  /**
+   * Ends a stranded deferred wake. Moving the row off `deferred_issue_execution`
+   * is what stops the stranded sweep from selecting it again, so this is the
+   * one place where that status may be left without an owner: it carries a
+   * readable reason and leaves the issue itself untouched, so a card waiting on
+   * a wake nobody can deliver is never reset to `todo` or reported as healthy.
+   */
+  async function retireStrandedDeferredWake(
+    wake: typeof agentWakeupRequests.$inferSelect,
+    issueId: string,
+    reason: StrandedWakeRetireReason,
+  ) {
+    const retired = await db.update(agentWakeupRequests).set({
+      status: "cancelled",
+      finishedAt: new Date(),
+      error: STRANDED_WAKE_RETIRE_REASONS[reason],
+      updatedAt: new Date(),
+    }).where(and(
+      eq(agentWakeupRequests.id, wake.id),
+      eq(agentWakeupRequests.companyId, wake.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    )).returning({ id: agentWakeupRequests.id });
+    if (!retired.length) return false;
+    logger.warn(
+      { queueId: wake.id, issueId, retireReason: reason, waitingMs: Date.now() - wake.requestedAt.getTime() },
+      "retired a stranded deferred wake that no run could promote",
+    );
+    await persistActivity(db, {
+      companyId: wake.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: "issue.deferred_wake_retired",
+      entityType: "issue",
+      entityId: issueId,
+      agentId: wake.agentId,
+      details: {
+        version: 1,
+        wakeupRequestId: wake.id,
+        reason,
+        message: STRANDED_WAKE_RETIRE_REASONS[reason],
+        requestedAt: wake.requestedAt.toISOString(),
+        waitingMs: Date.now() - wake.requestedAt.getTime(),
+      },
+    }).catch((err) => {
+      logger.warn({ err, queueId: wake.id }, "failed to record retired stranded wake");
+    });
+    return true;
   }
 
   async function resumeQueuedCommentInterrupt(companyId: string, queueId: string, opts?: { retryCleanup?: boolean }) {
@@ -19493,7 +19564,18 @@ export function heartbeatService(
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
-    const strandedQueues = await db.select({ wake: agentWakeupRequests })
+    //
+    // A release can also return without draining: `decidePreDrain` releases
+    // early when the finishing run needs reconciliation, and the release
+    // transaction never reaches the queue drain. Measured on 2026-10-06, such
+    // a wake was re-selected here every tick and waited 1.3 days behind no run
+    // at all. Every row therefore also passes `decideStrandedWakeFallback`,
+    // which gives it a bounded number of attempts and then ends it with a
+    // readable reason, so no wake stays in a state its owner can no longer reach.
+    const strandedQueues = await db.select({
+      wake: agentWakeupRequests,
+      issueStatus: issues.status,
+    })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
@@ -19508,20 +19590,69 @@ export function heartbeatService(
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
-    for (const { wake } of strandedQueues) {
+    for (const { wake, issueStatus } of strandedQueues) {
+      const strandedIssueId = String(wake.payload?.issueId);
       if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
-          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
+          !await readQueuedInteractionResponse(db, wake.companyId, strandedIssueId, wake.payload)) continue;
       const [latest] = await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${strandedIssueId}`,
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      const [liveRun] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, wake.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${strandedIssueId}`,
+        inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+      )).limit(1);
+      const priorAttempts = strandedSweepAttemptCount(wake.payload);
+      // This write is also the attempt counter. It only advances a row that is
+      // still deferred, so a wake retired further down cannot be re-armed here.
+      const [rearmed] = await db.update(agentWakeupRequests).set({
+        updatedAt: new Date(),
+        payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb),
+          '{strandedSweepAttempts}', to_jsonb(${priorAttempts + 1}::int))`,
+      }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-      ));
+      )).returning({ id: agentWakeupRequests.id });
+      if (!rearmed) continue;
+
+      // Read once and reused below: the release path asks the same question, and a
+      // second read could answer differently between the decision and the write.
+      const executionBlocker = await getExecutionBlocker(db, wake.companyId, strandedIssueId);
+      const hasUndeliveredUserComment = (await undeliveredLegacyUserCommentIds(
+        db, wake.companyId, strandedIssueId, wake.agentId,
+        queuedCommentIdsFromWakePayload(wake.payload),
+      )).length > 0;
+      const fallback = decideStrandedWakeFallback({
+        liveExecutionPresent: Boolean(liveRun),
+        activePauseHold: Boolean(
+          await treeControlSvc.getActivePauseHoldGate(wake.companyId, strandedIssueId),
+        ),
+        executionBlocked: Boolean(executionBlocker),
+        issueTerminal: ["done", "cancelled"].includes(issueStatus),
+        hasUndeliveredUserComment,
+        waitingMs: Date.now() - wake.requestedAt.getTime(),
+        staleAfterMs: STRANDED_WAKE_STALE_AFTER_MS,
+        priorAttempts,
+        maxAttempts: STRANDED_WAKE_MAX_ATTEMPTS,
+      });
+      if (fallback.kind === "retire") {
+        // A wake that still owes a human message must not simply disappear.
+        // Hand it to the normal delivery path first, which either queues it or
+        // records a durable skip; only then may the stranded row end.
+        if (hasUndeliveredUserComment) {
+          await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
+            logger.warn({ err, queueId: wake.id }, "failed to hand a stranded comment to normal delivery");
+          });
+        }
+        await retireStrandedDeferredWake(wake, strandedIssueId, fallback.reason);
+        continue;
+      }
+      if (fallback.kind === "wait") continue;
+
       if (!latest || latest.runtimeMode !== "legacy" || !isHeartbeatRunTerminalStatus(latest.status)) continue;
       const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
         latest.errorCode === "execution_reconciliation_required";
-      if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
+      if ((latest.status !== "cancelled" || cancelledAdmission) && executionBlocker) {
         await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
           logger.warn({ err, queueId: wake.id }, "failed to deliver saved legacy comment after recovery stopped");
         });

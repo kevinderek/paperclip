@@ -2,6 +2,9 @@
 //   - the admission decision (decideWakeAdmission), applied to a new wake
 //     that arrives while an active execution run already holds the issue's
 //     execution lock
+//   - the stranded-wake fallback decision (decideStrandedWakeFallback),
+//     applied to a deferred wake whose owning run already released the issue
+//     without promoting it, so the wake waits behind no run at all
 //   - the pre-drain decision (decidePreDrain), applied once per lock
 //     acquisition, before the caller touches the deferred-wake queue at all
 //   - the per-wake decision, split into decideQueuedCommentAction and
@@ -425,3 +428,110 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
 
   return { kind: "queue_recovery" };
 }
+
+export type StrandedWakeFallbackFacts = {
+  /** True while a live run (queued, running or scheduled_retry) still targets this issue. */
+  liveExecutionPresent: boolean;
+  /** True when an active subtree pause hold covers the issue. */
+  activePauseHold: boolean;
+  /** True when a platform execution hold (recovery action or conversation boundary) covers the issue. */
+  executionBlocked: boolean;
+  /** True when the issue is done or cancelled, so the wake no longer applies to a terminal task. */
+  issueTerminal: boolean;
+  /**
+   * True when the wake still carries at least one human comment that no run
+   * has delivered. Agent-authored comments are already visible in the thread,
+   * so only a human one is a reason to keep waiting instead of retiring.
+   */
+  hasUndeliveredUserComment: boolean;
+  /** Milliseconds since the wake was requested. */
+  waitingMs: number;
+  /** The sweep's own waiting bound. Past it a wake must reach an end state instead of looping. */
+  staleAfterMs: number;
+  /** How many times this sweep has already re-examined this wake. */
+  priorAttempts: number;
+  /** How many examinations this wake may receive before it must end. */
+  maxAttempts: number;
+};
+
+export type StrandedWakeFallbackDecision =
+  /** Leave the wake exactly as it is; a live owner or an explicit hold still owns it. */
+  | { kind: "wait" }
+  /** Re-enter normal wake admission so the platform decides whether to run it. */
+  | { kind: "redispatch" }
+  /** Retire the wake with a readable reason; its work can no longer become a run. */
+  | { kind: "retire"; reason: StrandedWakeRetireReason };
+
+export type StrandedWakeRetireReason =
+  | "issue_terminal"
+  | "no_undelivered_comments"
+  | "attempt_budget_exhausted";
+
+/** A stranded wake older than this may no longer be re-selected without ending. */
+export const STRANDED_WAKE_STALE_AFTER_MS = 60 * 60 * 1000;
+/** How many times the sweep may re-examine one stranded wake before it must retire it. */
+export const STRANDED_WAKE_MAX_ATTEMPTS = 5;
+
+/** The readable text each retirement reason carries onto the wake row. */
+export const STRANDED_WAKE_RETIRE_REASONS: Record<StrandedWakeRetireReason, string> = {
+  issue_terminal:
+    "Deferred wake retired: the issue reached a terminal status while this wake waited behind no run",
+  no_undelivered_comments:
+    "Deferred wake retired: nothing undelivered was left for a run to pick up",
+  attempt_budget_exhausted:
+    "Deferred wake retired: it waited past the stranded-wake bound without a run to pick it up",
+};
+
+/**
+ * Decides what happens to a deferred wake that no run owns. Measured on
+ * 2026-10-06 (REK-608): a wake whose owning run released the issue through
+ * `decidePreDrain`'s reconciliation branch is never re-examined by the drain,
+ * so it waited 1.3 days behind no run at all.
+ *
+ * Every branch that returns `retire` ends the row's `deferred_issue_execution`
+ * status, which is what stops the sweep from selecting it again. A paused,
+ * blocked or still-executed issue returns `wait`, because its owner has not
+ * disappeared. The attempt budget is the fallback for a wake that keeps
+ * returning `wait` for a reason no branch above can distinguish: it ends the
+ * wait instead of looping forever, and the reason says which rule closed it.
+ */
+export function decideStrandedWakeFallback(
+  facts: StrandedWakeFallbackFacts,
+): StrandedWakeFallbackDecision {
+  if (facts.liveExecutionPresent) return { kind: "wait" };
+  if (facts.activePauseHold) return { kind: "wait" };
+  if (facts.executionBlocked) return { kind: "wait" };
+
+  // Nothing is left that a run would have to read. This is the common case for
+  // a wake whose queued comments were all agent-authored: those are already in
+  // the thread, so retiring loses nothing.
+  if (!facts.hasUndeliveredUserComment) {
+    return { kind: "retire", reason: facts.issueTerminal ? "issue_terminal" : "no_undelivered_comments" };
+  }
+  // A terminal issue with an undelivered human comment is not retired here. The
+  // normal drain reopens a closed card for exactly that input, so this hands it
+  // back to that path instead of dropping it.
+  if (facts.issueTerminal) return { kind: "redispatch" };
+  // Past the bound the wait must end, or the row stays in a state no owner can
+  // reach. The caller hands the comment to the normal delivery path first, so the
+  // retirement ends the row without ending the conversation.
+  if (facts.priorAttempts >= facts.maxAttempts || facts.waitingMs >= facts.staleAfterMs) {
+    return { kind: "retire", reason: "attempt_budget_exhausted" };
+  }
+  return { kind: "redispatch" };
+}
+
+export type StrandedDeferredWakeProjection = {
+  wakeupRequestId: string;
+  reason: string | null;
+  requestedAt: string;
+  waitingMs: number;
+  queuedCommentCount: number;
+};
+
+/**
+ * A stranded deferred wake, projected for a view an agent routinely reads. The
+ * row is reported rather than repaired: the sweep owns the repair, and this
+ * read must never write.
+ */
+export const STRANDED_WAKE_PROJECTION_KEY = "strandedDeferredWake";

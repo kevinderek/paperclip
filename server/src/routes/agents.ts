@@ -11,6 +11,8 @@ import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { listStrandedDeferredWakes } from "../services/stranded-deferred-wakes.js";
+import { STRANDED_WAKE_STALE_AFTER_MS } from "../modules/wake-queue/domain/policy.js";
 import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaperclipRunnerProvider } from "@paperclipai/adapter-utils";
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
@@ -4207,9 +4209,15 @@ export function agentRoutes(
       ? rows.filter((issue) => new Date(issue.createdAt) >= new Date(worktreeActivation.cutoff))
       : [];
     const issueIds = eligibleRows.map((issue) => issue.id);
-    const [dependencyReadiness, recoveryActionByIssue] = await Promise.all([
+    const [dependencyReadiness, recoveryActionByIssue, strandedDeferredWakeByIssue] = await Promise.all([
       issuesSvc.listDependencyReadiness(req.actor.companyId, issueIds),
       recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
+      listStrandedDeferredWakes(db, {
+        companyId: req.actor.companyId,
+        agentId: req.actor.agentId,
+        issueIds,
+        olderThanMs: STRANDED_WAKE_STALE_AFTER_MS,
+      }),
     ]);
 
     res.json(
@@ -4228,6 +4236,10 @@ export function agentRoutes(
         dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
         unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
         unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
+        // A wake no run owns can no longer become work on its own. The oldest
+        // such wake is reported here so an agent reading its own inbox sees a
+        // card that is waiting rather than one that looks merely untouched.
+        strandedDeferredWake: strandedDeferredWakeByIssue.get(issue.id) ?? null,
       })),
     );
   });

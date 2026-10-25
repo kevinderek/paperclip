@@ -230,7 +230,9 @@ import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
   assertBoard,
   assertCompanyAccess,
+  assertCompanyAccessWithCrossCompanyReadGrant,
   getAccessibleResource,
+  getAccessibleResourceWithCrossCompanyReadGrant,
   getActorInfo,
 } from "./authz.js";
 import {
@@ -248,6 +250,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { auditCrossCompanyReadGrant } from "../services/cross-company-read-audit.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
@@ -5059,6 +5062,17 @@ export function issueRoutes(
     return false;
   }
 
+  // THE-40 Variant A: audit every cross-company read taken through the
+  // explicit per-agent grant (`activity_log`, action `cross_company.read`),
+  // via the shared testable helper. Same-company reads never write
+  // (`usedCrossCompanyReadGrant` is grant-gated inside the helper).
+  async function auditCrossCompanyRead(
+    req: Request,
+    input: { companyId: string; entityType: "company" | "issue" | "agent"; entityId: string; surface: "issue.list" | "issue.get" | "agent.list" | "agent.get" },
+  ) {
+    await auditCrossCompanyReadGrant(db, req, input);
+  }
+
   async function assertIssueWriteInfluenceAllowed(
     req: Request,
     res: Response,
@@ -7830,13 +7844,20 @@ export function issueRoutes(
   router.get("/companies/:companyId/issues", async (req, res) => {
     const startedAt = Date.now();
     const companyId = req.params.companyId as string;
-    assertCompanyAccess(req, companyId);
+    // THE-56: enumerated ADR surface `issue.list` — grant-aware gate.
+    assertCompanyAccessWithCrossCompanyReadGrant(req, companyId);
     if (isTaskBridgeKeyActor(req)) {
       res.status(403).json({
         error: "Task bridge keys cannot use company-wide issue list APIs",
       });
       return;
     }
+    await auditCrossCompanyRead(req, {
+      companyId,
+      entityType: "company",
+      entityId: companyId,
+      surface: "issue.list",
+    });
     const assigneeUserFilterRaw = req.query.assigneeUserId as
       string | undefined;
     const touchedByUserFilterRaw = req.query.touchedByUserId as
@@ -8792,7 +8813,8 @@ export function issueRoutes(
   router.get("/issues/:id", async (req, res) => {
     const requestStartedAt = performance.now();
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(
+    // THE-56: enumerated ADR surface `issue.get` — grant-aware gate.
+    const issue = await getAccessibleResourceWithCrossCompanyReadGrant(
       req,
       res,
       getIssueById(req, id),
@@ -8800,6 +8822,12 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    await auditCrossCompanyRead(req, {
+      companyId: issue.companyId,
+      entityType: "issue",
+      entityId: issue.id,
+      surface: "issue.get",
+    });
     const inboxArchiveFieldsPromise =
       req.actor.type === "board" && req.actor.userId
         ? svc.getActiveInboxArchiveFields(issue, req.actor.userId)

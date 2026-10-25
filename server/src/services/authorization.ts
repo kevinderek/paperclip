@@ -30,6 +30,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
+import { hasCrossCompanyReadGrant, isCrossCompanyReadAction } from "./cross-company-read-grants.js";
 
 export type AuthorizationActor =
   {
@@ -103,6 +104,7 @@ export type AuthorizationDecision = {
   code?: "RESPONSIBLE_USER_UNAUTHORIZED" | "RESPONSIBLE_USER_UNAVAILABLE";
   reason:
     | "allow_low_trust_boundary"
+    | "allow_cross_company_read_grant"
     | "allow_local_board"
     | "allow_instance_admin"
     | "allow_explicit_grant"
@@ -1858,6 +1860,20 @@ export function authorizationService(db: Db | DbTransaction) {
       });
     }
     if (input.actor.companyId !== companyId) {
+      // THE-40 Variant A: explicit per-agent read-only grant for designated
+      // Holding agents. Read actions in the allowlist only; writes, comments,
+      // secrets, wake and manage actions keep the fail-closed deny below.
+      if (
+        actorAgentId &&
+        isCrossCompanyReadAction(input.action) &&
+        hasCrossCompanyReadGrant(actorAgentId, companyId)
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_cross_company_read_grant",
+          explanation: "Allowed by explicit cross-company read grant.",
+        });
+      }
       return deny({
         action: input.action,
         reason: "deny_company_boundary",

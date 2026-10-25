@@ -3,6 +3,83 @@ import type { SecretBindingTargetType } from "@paperclipai/shared";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { responsibleUserAuthzShadowMode } from "../services/authorization.js";
+import { hasCrossCompanyReadGrant } from "../services/cross-company-read-grants.js";
+
+function isSafeMethod(method: unknown): boolean {
+  const normalized = typeof method === "string" ? method.toUpperCase() : "GET";
+  return ["GET", "HEAD", "OPTIONS"].includes(normalized);
+}
+
+/**
+ * THE-40 Variant A (THE-56): true when this request reads another company
+ * through an explicit per-agent cross-company read grant. Sync so route
+ * handlers can audit the granted read (`cross_company.read` in
+ * `activity_log`) right after the access check passes. Never true for writes
+ * (safe methods only) and never true without a grant (fail-closed).
+ *
+ * Compartmentalization (Voorwaarde 1): this helper is deliberately NOT called
+ * from the shared `assertCompanyAccess` / `hasCompanyAccess` /
+ * `getAccessibleResource` gates below. It is opt-in per enumerated ADR
+ * surface only (`issue.list`, `issue.get`, `agent.list`, `agent.get`) via
+ * `assertCompanyAccessWithCrossCompanyReadGrant` /
+ * `getAccessibleResourceWithCrossCompanyReadGrant`. Every other surface keeps
+ * fail-closed 403/404 for cross-company agents.
+ */
+export function usedCrossCompanyReadGrant(req: Request, companyId: string): boolean {
+  return req.actor.type === "agent"
+    && req.actor.companyId !== companyId
+    && isSafeMethod(req.method)
+    && hasCrossCompanyReadGrant(req.actor.agentId, companyId);
+}
+
+/**
+ * Grant-aware company gate for the four enumerated ADR read surfaces ONLY
+ * (`issue.list`, `issue.get`, `agent.list`, `agent.get`).
+ * Same fail-closed semantics as `assertCompanyAccess` plus the explicit
+ * per-agent grant short-circuit (safe methods only). Do NOT use on any other
+ * surface (assets, dashboard, recovery-observability, pipelines, skills, …).
+ */
+export function assertCompanyAccessWithCrossCompanyReadGrant(req: Request, companyId: string) {
+  if (usedCrossCompanyReadGrant(req, companyId)) {
+    logger.info({
+      crossCompanyReadGrant: true,
+      action: "company_access",
+      companyId,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+      actorCompanyId: req.actor.type === "agent" ? req.actor.companyId ?? null : null,
+      method: req.method,
+    }, "cross-company read grant access allowed");
+    return;
+  }
+  assertCompanyAccess(req, companyId);
+}
+
+/**
+ * Grant-aware resource gate for the enumerated single-resource ADR surfaces
+ * ONLY (`issue.get`, `agent.get`). Mirrors `getAccessibleResource` (404
+ * oracle preserved) plus the explicit per-agent grant. Do NOT use elsewhere.
+ */
+export async function getAccessibleResourceWithCrossCompanyReadGrant<T extends { companyId: string }>(
+  req: Request,
+  res: Response,
+  resource: T | null | undefined | Promise<T | null | undefined>,
+  notFoundMessage: string,
+): Promise<T | null> {
+  const resolved = await resource;
+  if (!resolved) {
+    res.status(404).json({ error: notFoundMessage });
+    return null;
+  }
+  const sameCompany = req.actor.type === "agent"
+    ? req.actor.companyId === resolved.companyId
+    : hasCompanyAccess(req, resolved.companyId);
+  if (!sameCompany && !usedCrossCompanyReadGrant(req, resolved.companyId)) {
+    res.status(404).json({ error: notFoundMessage });
+    return null;
+  }
+  assertCompanyAccessWithCrossCompanyReadGrant(req, resolved.companyId);
+  return resolved;
+}
 
 function throwOrShadowResponsibleUserCompanyAccessDeny(
   req: Request,
@@ -75,6 +152,10 @@ export function assertInstanceAdmin(req: Request) {
 export function assertCompanyAccess(req: Request, companyId: string) {
   assertAuthenticated(req);
   if (req.actor.type === "agent" && req.actor.companyId !== companyId) {
+    // THE-56 Voorwaarde 1: fail-closed. The cross-company read grant does
+    // NOT short-circuit here — grant access is opt-in per enumerated ADR
+    // surface via `assertCompanyAccessWithCrossCompanyReadGrant`. This keeps
+    // assets/dashboard/pipelines/skills and every other surface at 403.
     throw forbidden("Agent key cannot access another company");
   }
   if (req.actor.type === "agent" && req.actor.onBehalfOfUserId?.trim()) {
@@ -156,6 +237,8 @@ export function assertCompanyAccess(req: Request, companyId: string) {
  */
 export function hasCompanyAccess(req: Request, companyId: string): boolean {
   if (req.actor.type === "none") return false;
+  // THE-56 Voorwaarde 1: fail-closed. No grant short-circuit here; the
+  // enumerated ADR surfaces use `getAccessibleResourceWithCrossCompanyReadGrant`.
   if (req.actor.type === "agent") return req.actor.companyId === companyId;
   if (req.actor.source === "local_implicit") return true;
   return (req.actor.companyIds ?? []).includes(companyId);

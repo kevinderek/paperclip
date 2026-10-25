@@ -94,7 +94,8 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
-import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertBoard, assertCompanyAccess, assertCompanyAccessWithCrossCompanyReadGrant, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getAccessibleResourceWithCrossCompanyReadGrant, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { auditCrossCompanyReadGrant } from "../services/cross-company-read-audit.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
 import {
@@ -4028,7 +4029,8 @@ export function agentRoutes(
 
   router.get("/companies/:companyId/agents", async (req, res) => {
     const companyId = req.params.companyId as string;
-    assertCompanyAccess(req, companyId);
+    // THE-56: enumerated ADR surface `agent.list` — grant-aware gate.
+    assertCompanyAccessWithCrossCompanyReadGrant(req, companyId);
     const unsupportedQueryParams = Object.keys(req.query).sort();
     if (unsupportedQueryParams.length > 0) {
       res.status(400).json({
@@ -4036,6 +4038,14 @@ export function agentRoutes(
       });
       return;
     }
+    // THE-56 Voorwaarde 2: audit every granted cross-company read — after
+    // validation, so a 400 never writes a `cross_company.read` row.
+    await auditCrossCompanyReadGrant(db, req, {
+      companyId,
+      entityType: "company",
+      entityId: companyId,
+      surface: "agent.list",
+    });
     const result = await filterAgentsForActor(req, await svc.list(companyId));
     const canReadConfigs = await actorCanReadConfigurationsForCompany(req, companyId);
     if (canReadConfigs) {
@@ -4264,9 +4274,18 @@ export function agentRoutes(
 
   router.get("/agents/:id", async (req, res) => {
     const id = req.params.id as string;
-    const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+    // THE-56: enumerated ADR surface `agent.get` — grant-aware gate.
+    const agent = await getAccessibleResourceWithCrossCompanyReadGrant(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
     if (!(await assertAgentReadAllowed(req, res, agent))) return;
+    // THE-56 Voorwaarde 2: audit every granted cross-company read — after the
+    // read-allowed check, so a denied read never writes a row (issue.get parity).
+    await auditCrossCompanyReadGrant(db, req, {
+      companyId: agent.companyId,
+      entityType: "agent",
+      entityId: agent.id,
+      surface: "agent.get",
+    });
     const isSelf = req.actor.type === "agent" && req.actor.agentId === id;
     if (isSelf) {
       const trustPreset = await resolveAgentSelfTrustPreset(req, agent);

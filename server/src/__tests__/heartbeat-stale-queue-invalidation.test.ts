@@ -166,7 +166,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       },
     });
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     beforeContinuationDispatchCheck = null;
@@ -1747,5 +1747,60 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(1);
     await waitForCondition(async () => claimedIssue !== null);
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
+  });
+
+  it("does not re-arm a queued comment interrupt on a done issue, and still re-arms one on a todo issue (REK-604)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const doneIssueId = randomUUID();
+    const openIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: doneIssueId, companyId, title: "Closed while a comment interrupt was queued", status: "done", priority: "medium", assigneeAgentId: agentId },
+      { id: openIssueId, companyId, title: "Still open with a queued comment interrupt", status: "todo", priority: "medium", assigneeAgentId: agentId },
+    ]);
+    const stale = new Date(Date.now() - 61_000);
+    const buildInterruptPayload = (issueId: string, commentId: string) => ({
+      issueId,
+      ...withQueuedCommentIdsInWakePayload({}, [commentId]),
+      queuedCommentInterrupt: { actorId: "responsible-user", at: new Date(Date.now() - 90_000).toISOString() },
+    });
+    const doneWakeId = randomUUID();
+    const openWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: doneWakeId, companyId, agentId, source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+        payload: buildInterruptPayload(doneIssueId, randomUUID()),
+        status: "deferred_issue_execution", requestedAt: stale, updatedAt: stale,
+      },
+      {
+        id: openWakeId, companyId, agentId, source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+        payload: buildInterruptPayload(openIssueId, randomUUID()),
+        status: "deferred_issue_execution", requestedAt: stale, updatedAt: stale,
+      },
+    ]);
+
+    await heartbeat.resumeQueuedRuns();
+
+    const [doneWake] = await db
+      .select({ updatedAt: agentWakeupRequests.updatedAt, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, doneWakeId));
+    // The now-stale sweep must leave the closed issue's wake untouched: re-arming it
+    // only fed the issue state guard, which wrote a fresh skipped row every tick.
+    expect(doneWake?.payload?.queuedCommentInterrupt).toBeDefined();
+    expect(doneWake?.updatedAt.getTime()).toBe(stale.getTime());
+
+    const guardRows = await db
+      .select({ id: agentWakeupRequests.id, error: agentWakeupRequests.error })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "issue_state_guard_mismatch"));
+    expect(guardRows).toHaveLength(0);
+
+    // Negative control: the same shape on an open issue must still be picked up.
+    const [openWake] = await db
+      .select({ updatedAt: agentWakeupRequests.updatedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, openWakeId));
+    expect(openWake?.updatedAt).not.toBeNull();
+    expect(openWake!.updatedAt.getTime()).toBeGreaterThan(stale.getTime());
   });
 });

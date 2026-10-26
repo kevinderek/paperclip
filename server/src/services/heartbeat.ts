@@ -19547,6 +19547,12 @@ export function heartbeatService(
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
+      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        // REK-604: a done/cancelled issue can no longer accept a queued comment.
+        // Without this filter the sweep re-armed the row every 30 s and the
+        // issue state guard wrote a new skipped row every minute, forever.
+        notInArray(issues.status, ["done", "cancelled"])))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
